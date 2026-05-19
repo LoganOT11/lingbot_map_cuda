@@ -13,4 +13,5 @@ CLAUDE.md
 skyseg.onnx
 lingbot-map-long.pt
 agent.md
+improvements.md
 example/courthouse_sky_masks

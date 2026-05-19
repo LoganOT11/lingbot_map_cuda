@@ -20,10 +20,35 @@ Usage:
 
 import argparse
 import glob
+import logging
 import os
 import sys
 import tempfile
 import time
+
+# ── Logging: force flush so messages appear even when downstream code runs
+#    infinite loops (e.g. the viser viewer).  All print() calls use flush=True
+#    for the same reason.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-5s  %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stderr,
+)
+_log = logging.getLogger("demo")
+
+# ── Named constants (previously magic numbers) ────────────────────────────
+# Max frames before keyframe auto-selection kicks in.  Above this threshold
+# the KV cache would exceed the training RoPE range (320 views).
+_KEYFRAME_AUTO_THRESHOLD = 320
+# Number of streaming frames used in the torch.compile CUDA-graph warmup.
+_WARM_STREAM_N_DEFAULT = 10
+# Compiled warmup dress-rehearsal passes (1st captures graphs, 2nd/3rd replay).
+_COMPILED_WARMUP_PASSES = 3
+# Compute capability threshold for bfloat16 support (Turing / SM 7.5+).
+_BF16_MIN_CAPABILITY = 8
+# GPU memory threshold (GB) — warn if free memory is below this.
+_GPU_MEM_WARN_GB = 10.0
 
 # Must be set before `import torch` / any CUDA init. Reduces the reserved-vs-allocated
 # memory gap by letting the caching allocator grow segments on demand instead of
@@ -54,7 +79,7 @@ from lingbot_map.utils.load_fn import load_and_preprocess_images
 # =============================================================================
 
 def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png,.JPG",
-                first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8,
+                first_k=None, stride=1, image_size=518, patch_size=14,
                 rotate_clockwise_90=False):
     """Load images from folder or video and preprocess into a tensor.
 
@@ -130,12 +155,12 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
 
 def load_model(args, device):
     """Load GCTStream model from checkpoint."""
-    if getattr(args, "mode", "streaming") == "windowed":
+    if args.mode == "windowed":
         from lingbot_map.models.gct_stream_window import GCTStream
     else:
         from lingbot_map.models.gct_stream import GCTStream
 
-    print("Building model...")
+    _log.info("Building model...")
     model = GCTStream(
         img_size=args.image_size,
         patch_size=args.patch_size,
@@ -150,15 +175,16 @@ def load_model(args, device):
     )
 
     if args.model_path:
-        print(f"Loading checkpoint: {args.model_path}")
+        _log.info("Loading checkpoint: %s", args.model_path)
         ckpt = torch.load(args.model_path, map_location='cpu', weights_only=False)
         state_dict = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
-            print(f"  Missing keys: {len(missing)}")
+            _log.info("  Missing keys: %d", len(missing))
         if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
-        print("  Checkpoint loaded.")
+            _log.info("  Unexpected keys: %d", len(unexpected))
+        del ckpt  # free CPU RAM; state_dict is already loaded into the model
+        _log.info("  Checkpoint loaded.")
 
     return model.to(device).eval()
 
@@ -291,7 +317,7 @@ def postprocess(predictions, images):
     predictions.pop("pose_enc_list", None)
     predictions.pop("images", None)
 
-    print("Moving results to CPU...")
+    _log.info("Moving results to CPU...")
     for k in list(predictions.keys()):
         if isinstance(predictions[k], torch.Tensor):
             predictions[k] = _squeeze_single_batch(
@@ -320,14 +346,9 @@ def prepare_for_visualization(predictions, images=None):
         images = predictions.get("images")
 
     if isinstance(images, torch.Tensor):
-        images = images.detach().cpu()
-    if isinstance(images, np.ndarray):
+        images = _squeeze_single_batch("images", images.detach().cpu()).numpy()
+    elif isinstance(images, np.ndarray):
         images = _squeeze_single_batch("images", images)
-    elif isinstance(images, torch.Tensor):
-        images = _squeeze_single_batch("images", images).numpy()
-
-    if isinstance(images, torch.Tensor):
-        images = images.numpy()
 
     if images is not None:
         vis_predictions["images"] = images
@@ -387,7 +408,7 @@ def main():
     parser.add_argument(
         "--offload_to_cpu",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Offload per-frame predictions to CPU during inference to cut GPU peak memory "
             "(on by default).  Use --no-offload_to_cpu to keep outputs on GPU.",
     )
@@ -420,6 +441,19 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # ── GPU memory check ─────────────────────────────────────────────────────
+    if device.type == "cuda":
+        free_gb, total_gb = (x / 1e9 for x in torch.cuda.mem_get_info())
+        _log.info("GPU: %s | %.1f GB free / %.1f GB total",
+                  torch.cuda.get_device_name(0), free_gb, total_gb)
+        if free_gb < _GPU_MEM_WARN_GB:
+            _log.warning(
+                "Less than %.0f GB GPU memory free (%.1f GB). "
+                "Consider: --use_sdpa --offload_to_cpu --num_scale_frames 4 "
+                "--mode windowed --window_size 16",
+                _GPU_MEM_WARN_GB, free_gb,
+            )
+
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
     images, paths, resolved_image_folder = load_images(
@@ -446,56 +480,61 @@ def main():
 
     # Pick inference dtype; autocast still runs for the ops that need fp32 (e.g. LayerNorm).
     if torch.cuda.is_available():
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        if torch.cuda.get_device_capability()[0] >= _BF16_MIN_CAPABILITY:
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
     else:
         dtype = torch.float32
+    _log.info("Inference dtype: %s", dtype)
 
     # Cast the aggregator (DINOv2-style trunk) to the inference dtype to remove the
     # redundant fp32 master weight copy + autocast bf16 weight cache (~2-3 GB saved,
     # no measurable quality change). gct_base._predict_* upcasts inputs to fp32 and
     # runs each head under `autocast(enabled=False)`, so camera/depth/point heads
     # keep fp32 weights automatically.
-    if dtype != torch.float32 and getattr(model, "aggregator", None) is not None:
-        print(f"Casting aggregator to {dtype} (heads kept in fp32)")
+    if dtype != torch.float32 and model.aggregator is not None:
+        _log.info("Casting aggregator to %s (heads kept in fp32)", dtype)
         model.aggregator = model.aggregator.to(dtype=dtype)
 
     images = images.to(device)
     num_frames = images.shape[0]
-    print(f"Input: {num_frames} frames, shape {tuple(images.shape)}")
-    print(f"Mode: {args.mode}")
+    _log.info("Input: %d frames, shape %s", num_frames, tuple(images.shape))
+    _log.info("Mode: %s", args.mode)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print(
-            f"GPU mem after load: "
-            f"alloc={torch.cuda.memory_allocated()/1e9:.2f} GB, "
-            f"reserved={torch.cuda.memory_reserved()/1e9:.2f} GB"
+        _log.info(
+            "GPU mem after load: alloc=%.2f GB, reserved=%.2f GB",
+            torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9,
         )
 
     if args.keyframe_interval is None:
-        if args.mode == "streaming" and num_frames > 320:
-            args.keyframe_interval = (num_frames + 319) // 320
-            print(
-                f"Auto-selected --keyframe_interval={args.keyframe_interval} "
-                f"(num_frames={num_frames} > 320)."
+        if args.mode == "streaming" and num_frames > _KEYFRAME_AUTO_THRESHOLD:
+            args.keyframe_interval = (num_frames + _KEYFRAME_AUTO_THRESHOLD - 1) // _KEYFRAME_AUTO_THRESHOLD
+            _log.info(
+                "Auto-selected --keyframe_interval=%d (num_frames=%d > %d)",
+                args.keyframe_interval, num_frames, _KEYFRAME_AUTO_THRESHOLD,
             )
         else:
             args.keyframe_interval = 1
 
     if args.keyframe_interval > 1:
         if args.mode == "streaming":
-            print(
-                f"Keyframe streaming enabled: interval={args.keyframe_interval} "
-                f"(after the first {args.num_scale_frames} scale frames)."
+            _log.info(
+                "Keyframe streaming enabled: interval=%d (after the first %d scale frames)",
+                args.keyframe_interval, args.num_scale_frames,
             )
         else:  # windowed
             actual_per_window = (
                 args.num_scale_frames
                 + max(0, args.window_size - args.num_scale_frames) * args.keyframe_interval
             )
-            print(
-                f"Keyframe windowed enabled: interval={args.keyframe_interval}, "
-                f"each window covers up to {actual_per_window} actual frames "
-                f"(window_size={args.window_size} keyframes, scale={args.num_scale_frames})."
+            _log.info(
+                "Keyframe windowed: interval=%d, each window ≤%d actual frames "
+                "(window_size=%d keyframes, scale=%d)",
+                args.keyframe_interval, actual_per_window,
+                args.window_size, args.num_scale_frames,
             )
 
     # ── Optional: torch.compile + CUDA-graph warmup (streaming only) ────────
@@ -509,7 +548,7 @@ def main():
             scale_for_warm = min(args.num_scale_frames, num_frames)
             if scale_for_warm >= num_frames:
                 scale_for_warm = max(1, num_frames - 1)
-            warm_stream_n = min(10, max(1, num_frames - scale_for_warm))
+            warm_stream_n = min(_WARM_STREAM_N_DEFAULT, max(1, num_frames - scale_for_warm))
             warm_h, warm_w = int(images.shape[-2]), int(images.shape[-1])
             print(
                 f"Warmup eager (scale={scale_for_warm} + {warm_stream_n} streaming, "
@@ -528,16 +567,18 @@ def main():
             # 3 passes under compile: 1st captures CUDA graphs, 2nd/3rd replay so
             # the caching allocator / graph-address map converge on the state the
             # real inference will see. See gct_profile.py:302-306 for rationale.
-            print("Warmup compiled (3x dress rehearsal)...")
+            _log.info("Warmup compiled (%dx dress rehearsal)...", _COMPILED_WARMUP_PASSES)
             t_warm = time.time()
             _warm_streaming(
                 model, images, scale_for_warm, warm_stream_n, dtype,
-                passes=3, keyframe_interval=args.keyframe_interval,
+                passes=_COMPILED_WARMUP_PASSES, keyframe_interval=args.keyframe_interval,
             )
             print(f"  compiled warmup: {time.time() - t_warm:.1f}s")
 
     # ── Inference ────────────────────────────────────────────────────────────
-    print(f"Running {args.mode} inference (dtype={dtype})...")
+    _log.info("Running %s inference (dtype=%s)...", args.mode, dtype)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
 
     output_device = torch.device("cpu") if args.offload_to_cpu else None
@@ -561,28 +602,32 @@ def main():
                 output_device=output_device
             )
 
-    print(f"Inference done in {time.time() - t0:.1f}s")
+    inf_elapsed = time.time() - t0
+    _log.info("Inference done in %.1f s (%.1f FPS)",
+              inf_elapsed, num_frames / inf_elapsed if inf_elapsed > 0 else float("inf"))
     if torch.cuda.is_available():
-        print(
-            f"GPU peak during inference: "
-            f"{torch.cuda.max_memory_allocated()/1e9:.2f} GB "
-            f"(reserved peak {torch.cuda.max_memory_reserved()/1e9:.2f} GB)"
+        _log.info(
+            "GPU peak during inference: alloc=%.2f GB, reserved=%.2f GB",
+            torch.cuda.max_memory_allocated() / 1e9,
+            torch.cuda.max_memory_reserved() / 1e9,
         )
 
     # ── Post-process ─────────────────────────────────────────────────────────
-    if args.offload_to_cpu:
-        del images
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        images_for_post = predictions["images"]  # already CPU
-    else:
-        images_for_post = images
+    # Free GPU images tensor unconditionally — no longer needed after inference.
+    del images
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    images_for_post = predictions["images"]  # on CPU if output_device was CPU
 
+    _log.info("Post-processing predictions...")
     predictions, images_cpu = postprocess(predictions, images_for_post)
+    _log.info("Post-processing complete.  Predictions: %s",
+              sorted(predictions.keys()))
 
     # ── Visualize ────────────────────────────────────────────────────────────
     try:
         from lingbot_map.vis import PointCloudViewer
+        _log.info("Building 3D viewer...")
         viewer = PointCloudViewer(
             pred_dict=prepare_for_visualization(predictions, images_cpu),
             port=args.port,
@@ -594,11 +639,12 @@ def main():
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
         )
-        print(f"3D viewer at http://localhost:{args.port}")
+        _log.info("=== Pipeline complete ===")
+        _log.info("3D viewer at http://localhost:%d  (Ctrl+C to stop)", args.port)
         viewer.run()
     except ImportError:
-        print("viser not installed. Install with: pip install lingbot-map[vis]")
-        print(f"Predictions contain keys: {list(predictions.keys())}")
+        _log.warning("viser not installed. Install with: pip install lingbot-map[vis]")
+        _log.info("Predictions contain keys: %s", sorted(predictions.keys()))
 
 
 if __name__ == "__main__":
