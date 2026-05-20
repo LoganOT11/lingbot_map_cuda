@@ -1,0 +1,52 @@
+# Layer 0 Safety Fixes — minimal CPU-only test image
+#
+# Build:
+#   docker build -t lingbot-safety-fixes -f Dockerfile.layer0 .
+#
+# Run tests:
+#   docker run --rm lingbot-safety-fixes
+#
+# This image does NOT contain CUDA or GPU dependencies.
+# It validates the safety-fix logic (try/finally guards, frame limits,
+# memory budget estimates) without requiring a GPU or model checkpoint.
+
+FROM python:3.10-slim
+
+LABEL org.opencontainers.image.description="LingBot-MAP Layer 0 safety fixes tests"
+LABEL stage=test
+
+# ── System deps for opencv-python-headless ──────────────────────────────
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python dependencies (CPU-only torch for fast install) ───────────────
+RUN pip install --no-cache-dir \
+    torch==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir \
+    numpy \
+    einops \
+    safetensors \
+    scipy \
+    Pillow \
+    opencv-python-headless \
+    huggingface_hub \
+    tqdm \
+    pytest
+
+# ── Application code ────────────────────────────────────────────────────
+WORKDIR /app
+
+# Copy only the package and tests (no model checkpoint, no docs, no apps)
+COPY pyproject.toml .
+COPY lingbot_map/ lingbot_map/
+COPY tests/ tests/
+
+# Make the package importable
+ENV PYTHONPATH=/app
+
+# ── Run tests ───────────────────────────────────────────────────────────
+CMD ["python", "-m", "pytest", "tests/test_safety_fixes.py", "-v", "--tb=short", "--color=yes"]

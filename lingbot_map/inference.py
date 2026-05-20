@@ -96,6 +96,160 @@ def load_model(
 
 
 # ---------------------------------------------------------------------------
+# Safety: frame-count validation
+# ---------------------------------------------------------------------------
+
+# Hard cap for streaming mode: the FlashInfer special-page pool is pre-allocated
+# for max_frame_num + 100 frames.  Beyond that, append_frame() asserts.
+_MAX_FRAMES_STREAMING = 1100
+
+# Arbitrary safety limit for windowed mode (each window is independent, but
+# we need a ceiling to prevent unbounded disk/RAM usage).
+_MAX_FRAMES_WINDOWED = 50000
+
+
+def validate_frame_count(
+    num_frames: int,
+    mode: str,
+    *,
+    max_frames_streaming: int = _MAX_FRAMES_STREAMING,
+    max_frames_windowed: int = _MAX_FRAMES_WINDOWED,
+) -> None:
+    """Raise ``ValueError`` if *num_frames* would crash or degrade.
+
+    Streaming mode has a hard cap because the FlashInfer special-token page
+    pool is pre-allocated for ``max_frame_num + 100`` frames (default 1124).
+    Windowed mode is unbounded per-window but we apply a safety ceiling.
+
+    Args:
+        num_frames: Number of frames in the input sequence.
+        mode: ``"streaming"`` or ``"windowed"``.
+        max_frames_streaming: Override for the streaming cap.
+        max_frames_windowed: Override for the windowed ceiling.
+
+    Raises:
+        ValueError: If *num_frames* exceeds the limit for the chosen *mode*.
+    """
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be positive, got {num_frames}")
+
+    if mode == "streaming" and num_frames > max_frames_streaming:
+        raise ValueError(
+            f"Streaming mode supports at most {max_frames_streaming} frames "
+            f"(got {num_frames}).  Switch to mode='windowed' for longer "
+            f"sequences, or increase --max_frame_num to grow the special-page "
+            f"pool (at the cost of GPU memory)."
+        )
+
+    if num_frames > max_frames_windowed:
+        raise ValueError(
+            f"Maximum {max_frames_windowed} frames supported "
+            f"(got {num_frames})."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Safety: GPU memory budget estimation
+# ---------------------------------------------------------------------------
+
+def estimate_gpu_memory(
+    resolution: tuple[int, int],
+    num_frames_in_window: int,
+    backend: str = "flashinfer",
+    dtype: torch.dtype | None = None,
+    *,
+    patch_size: int = 14,
+    num_blocks: int = 24,
+    num_heads: int = 16,
+    head_dim: int = 64,
+    num_special_tokens: int = 6,
+    model_weight_gb: float = 2.8,
+    activations_gb: float = 1.0,
+) -> dict:
+    """Estimate peak GPU memory for one processing window.
+
+    This is a static approximation — it does **not** query the GPU.  Use it
+    for pre-flight checks before launching inference.
+
+    Args:
+        resolution: ``(height, width)`` of preprocessed frames.
+        num_frames_in_window: Frames held in the KV cache at once
+            (typically ``num_scale_frames + kv_cache_sliding_window``).
+        backend: ``"flashinfer"`` (paged) or ``"sdpa"`` (dict-based).
+        dtype: ``torch.bfloat16`` or ``torch.float16``.  If ``None``,
+            ``torch.bfloat16`` is assumed (2 bytes per element).
+        patch_size: Patch size for ViT embedding (default 14).
+        num_blocks: Transformer blocks (default 24 for ViT-L).
+        num_heads: Attention heads (default 16).
+        head_dim: Dimension per head (default 64).
+        num_special_tokens: Special tokens per frame (camera + reg + scale).
+        model_weight_gb: Approximate model weight size in GB (bf16 mixed).
+        activations_gb: Conservative activation memory estimate.
+
+    Returns:
+        dict with keys ``model_gb``, ``kv_cache_gb``, ``special_pages_gb``,
+        ``activations_gb``, ``total_gb`` — all rounded to one decimal.
+    """
+    if dtype is None:
+        bytes_per_element = 2  # bfloat16
+    elif dtype == torch.float32:
+        bytes_per_element = 4
+    else:
+        bytes_per_element = 2  # float16 / bfloat16
+
+    h, w = resolution
+    patches_h = h // patch_size
+    patches_w = w // patch_size
+    patches_per_frame = patches_h * patches_w
+    tokens_per_frame = patches_per_frame + num_special_tokens
+
+    if backend not in ("flashinfer", "sdpa"):
+        raise ValueError(
+            f"Unknown backend '{backend}'.  Choose 'flashinfer' or 'sdpa'."
+        )
+
+    if backend == "flashinfer":
+        # Page size = patches_per_frame (exact fit for FA2)
+        page_size = patches_per_frame
+        elements_per_page = page_size * num_heads * head_dim
+        bytes_per_page_block = elements_per_page * bytes_per_element * 2  # K + V
+
+        # Patch pages: scale (8) + window (variable) + headroom (16)
+        patch_pages = 8 + num_frames_in_window + 16
+        kv_cache_gb = (patch_pages * bytes_per_page_block * num_blocks) / 1e9
+
+        # Special pages: pre-allocated for ~1124 frames worth of specials
+        # ceil(max_frames * specials_per_frame / page_size) + 16 headroom
+        max_frames_special = 1124
+        special_pages = (
+            (max_frames_special * num_special_tokens + page_size - 1) // page_size
+            + 16
+        )
+        special_gb = (special_pages * bytes_per_page_block * num_blocks) / 1e9
+    else:
+        # SDPA: per-frame K+V tensors, no paging overhead
+        elements_per_frame = (
+            2  # K + V
+            * num_heads
+            * tokens_per_frame
+            * head_dim
+        )
+        bytes_per_frame = elements_per_frame * bytes_per_element
+        kv_cache_gb = (num_frames_in_window * bytes_per_frame * num_blocks) / 1e9
+        special_gb = 0.0
+
+    total_gb = model_weight_gb + kv_cache_gb + special_gb + activations_gb
+
+    return {
+        "model_gb": round(model_weight_gb, 1),
+        "kv_cache_gb": round(kv_cache_gb, 1),
+        "special_pages_gb": round(special_gb, 1),
+        "activations_gb": round(activations_gb, 1),
+        "total_gb": round(total_gb, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Post-processing
 # ---------------------------------------------------------------------------
 
