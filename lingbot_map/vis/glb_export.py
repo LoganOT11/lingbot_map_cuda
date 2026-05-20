@@ -214,7 +214,7 @@ def _apply_sky_mask(
     image_list = sorted(os.listdir(target_dir_images))
     S, H, W = conf.shape if hasattr(conf, "shape") else (len(images), images.shape[1], images.shape[2])
 
-    skyseg_model_path = "skyseg.onnx"
+    skyseg_model_path = "models/skyseg.onnx"
     if not os.path.exists(skyseg_model_path):
         print("Downloading skyseg.onnx...")
         download_file_from_url(

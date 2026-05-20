@@ -1,6 +1,8 @@
 """Sky segmentation utilities.
 
-Adapted from lingbot_map.vis.sky_segmentation to keep demo_render self-contained.
+Fork of lingbot_map.vis.sky_segmentation with batch-processing additions.
+TODO: upstream batch features into lingbot_map.vis.sky_segmentation, then
+replace this module with a thin re-export.
 """
 
 from __future__ import annotations

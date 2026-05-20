@@ -211,7 +211,7 @@ def load_or_create_sky_masks(
     image_folder: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
     images: Optional[np.ndarray] = None,
-    skyseg_model_path: str = "skyseg.onnx",
+    skyseg_model_path: str = "models/skyseg.onnx",
     sky_mask_dir: Optional[str] = None,
     sky_mask_visualization_dir: Optional[str] = None,
     target_shape: Optional[Tuple[int, int]] = None,
@@ -375,7 +375,7 @@ def apply_sky_segmentation(
     image_folder: Optional[str] = None,
     image_paths: Optional[list[str]] = None,
     images: Optional[np.ndarray] = None,
-    skyseg_model_path: str = "skyseg.onnx",
+    skyseg_model_path: str = "models/skyseg.onnx",
     sky_mask_dir: Optional[str] = None,
     sky_mask_visualization_dir: Optional[str] = None,
 ) -> np.ndarray:
@@ -427,7 +427,7 @@ def apply_sky_segmentation(
     return conf
 
 
-def download_skyseg_model(output_path: str = "skyseg.onnx") -> str:
+def download_skyseg_model(output_path: str = "models/skyseg.onnx") -> str:
     """
     Download sky segmentation model from HuggingFace.
 

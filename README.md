@@ -14,6 +14,44 @@ clouds in real time.
 
 ---
 
+## Repository Structure
+
+```
+lingbot_map_cuda/
+├── lingbot_map/           # Core library (pip-installable Python package)
+│   ├── models/            # GCTStream, GCTBase, windowed variant
+│   ├── aggregator/        # KV cache (FlashInfer/SDPA), feature aggregation
+│   ├── layers/            # Attention, blocks, RoPE, patch embedding
+│   ├── heads/             # Camera head (iterative refinement), DPT depth head
+│   ├── utils/             # Pose encoding, geometry, image loading
+│   ├── vis/               # GLB export, sky segmentation, Viser wrapper
+│   └── inference.py       # Shared: load_model, postprocess, prepare_for_visualization
+│
+├── apps/                  # Entry points — each is a deployable unit
+│   ├── cli/               # CLI demo (demo.py) + profiling (gct_profile.py)
+│   ├── batch/             # Batch processing + offline rendering (batch_demo)
+│   ├── rgbd_render/       # Point-cloud → video render pipeline
+│   ├── viewer/            # Interactive WebSocket 3D viewer
+│   └── cuda_ext/          # Compiled CUDA kernels (frustum cull, voxelize)
+│
+├── models/                # Binary model files
+│   ├── lingbot-map-long.pt  (4.63 GB)
+│   └── skyseg.onnx           (176 MB)
+│
+├── config/                # YAML presets for render pipeline
+├── example/               # Example scenes (courthouse, university, loop, oxford)
+├── assets/                # Static assets
+├── docs/                  # Architecture notes, agent reference
+│
+├── demo.py                # Backward-compat shim → apps/cli/demo.py
+├── gct_profile.py         # Backward-compat shim → apps/cli/gct_profile.py
+├── demo_render/           # Backward-compat shims → apps/batch/
+├── pyproject.toml         # pip install -e .
+└── README.md
+```
+
+---
+
 ## ⚙️ Installation
 
 **1. Create conda environment**
@@ -71,18 +109,27 @@ pip install onnxruntime-gpu    # GPU (faster for large image sets)
 Models are available on [HuggingFace](https://huggingface.co/robbyant/lingbot-map)
 and [ModelScope](https://www.modelscope.cn/models/Robbyant/lingbot-map).
 
+Place downloaded model files in `models/`.
+
 ---
 
 ## 🚀 Quick Start
 
 ```bash
-python demo.py --model_path lingbot-map-long.pt \
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --mask_sky
 ```
 
 This launches an interactive [viser](https://github.com/nerfstudio-project/viser)
 3D viewer at `http://localhost:8080`. The viewer loops through all frames — press
 Ctrl+C to stop, or use the "Playing" checkbox to pause/resume.
+
+The root `demo.py` shim also works for backward compatibility:
+
+```bash
+python demo.py --model_path models/lingbot-map-long.pt \
+    --image_folder example/courthouse --mask_sky
+```
 
 ### Example Scenes
 
@@ -99,14 +146,14 @@ Four pre-packaged scenes in `example/`:
 
 **Quick test (10 frames):**
 ```bash
-python demo.py --model_path lingbot-map-long.pt \
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --use_sdpa --mask_sky --first_k 10
 ```
 Model loads in ~10s, inference ~3s, GPU peaks at ~4.6 GB.
 
 **Full run (286 frames, windowed mode):**
 ```bash
-python demo.py --model_path lingbot-map-long.pt \
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse \
     --use_sdpa --mode windowed \
     --window_size 16 --overlap_size 4 --num_scale_frames 4 \
@@ -116,20 +163,27 @@ Processes all 286 frames in ~1 minute. Peak GPU ~5.6 GB.
 
 **Long sequences (>3000 frames):**
 ```bash
-python demo.py --model_path lingbot-map-long.pt \
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --video_path video.mp4 --fps 10 \
     --mode windowed --window_size 128 --overlap_keyframes 16 --keyframe_interval 2
 ```
 
+**Headless with NPZ export:**
+```bash
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
+    --image_folder example/courthouse --use_sdpa \
+    --headless --save_predictions outputs/
+```
+
 **Fast inference (reduced quality):**
 ```bash
-python demo.py --model_path lingbot-map-long.pt \
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --mask_sky --camera_num_iterations 1
 ```
 
 **FlashInfer (requires ≥12 GB GPU):**
 ```bash
-python demo.py --model_path lingbot-map-long.pt \
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --mask_sky
 ```
 
@@ -204,12 +258,19 @@ For sequences longer than ~3000 frames, switch to `--mode windowed`.
 
 ## 🎥 Offline Rendering
 
-For sequences too long for the interactive viewer, use `demo_render/batch_demo.py`
+For sequences too long for the interactive viewer, use `apps/batch/main.py`
 for headless point-cloud flythrough MP4 generation. Supports multiple camera modes
-(follow, birdeye, static, pivot) configured via YAML presets in `demo_render/config/`.
+(follow, birdeye, static, pivot) configured via YAML presets in `config/`.
 
-Requires additional dependencies: open3d, kaolin, ffmpeg, CUDA extensions. See the
-original README or source comments for setup instructions.
+```bash
+python apps/batch/main.py --model_path models/lingbot-map-long.pt \
+    --input_folder example/ --output_folder outputs/ \
+    --mode windowed --window_size 16 --overlap_size 4 \
+    --config config/outdoor_large.yaml
+```
+
+Requires additional dependencies: open3d, kaolin, ffmpeg, CUDA extensions. See
+source comments for setup instructions.
 
 ---
 

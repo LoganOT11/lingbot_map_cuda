@@ -195,7 +195,7 @@ def run_parallel(scene: Scene, camera_path: CameraPath,
 
     # Ensure spawned workers can find render_cuda_ext at module import time
     _ext_dir = os.path.abspath(os.path.join(
-        os.path.dirname(__file__), '..', '..', 'render_cuda_ext'))
+        os.path.dirname(__file__), '..', '..', 'cuda_ext'))
     if os.path.isdir(_ext_dir):
         pp = os.environ.get('PYTHONPATH', '')
         if _ext_dir not in pp.split(os.pathsep):

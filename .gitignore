@@ -6,12 +6,13 @@ dist/
 build/
 *.so
 .eggs/
-demo_render/
 CLAUDE.md
 .claude/
 .agents/
-skyseg.onnx
-lingbot-map-long.pt
-agent.md
-improvements.md
+
+# Binary model files (tracked via DVC or downloaded separately)
+models/*.pt
+models/*.onnx
+
+# Generated data
 example/courthouse_sky_masks

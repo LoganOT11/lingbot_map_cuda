@@ -20,12 +20,12 @@ import cv2
 import numpy as np
 import torch
 
-# Add project root to path
+# Add project root to path so that lingbot_map and apps packages are importable
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from demo_render.interactive_viewer.camera import KeyframeAnimator, OrbitCamera  # noqa: E402
+from apps.viewer.camera import KeyframeAnimator, OrbitCamera  # noqa: E402
 
 # Import loader and unproject directly to avoid rgbd_render/__init__.py
 # which pulls in CUDA extensions that may not be built.
