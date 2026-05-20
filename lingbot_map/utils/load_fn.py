@@ -249,3 +249,145 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
     if fx is not None:
         return images, fx, fy, cx, cy
     return images
+
+
+def load_and_preprocess_video_stream(
+    video_source: str | bytes,
+    *,
+    fps: int = 5,
+    image_size: int = 518,
+    patch_size: int = 14,
+    max_frames: int | None = None,
+) -> "Iterator[tuple[int, torch.Tensor]]":
+    """Stream-decode video frames one at a time, yielding preprocessed tensors.
+
+    Unlike :func:`load_and_preprocess_images` which loads everything into a
+    single tensor, this generator never holds more than one frame in memory.
+    Ideal for long videos and web-upload processing.
+
+    Args:
+        video_source: File path (``str``) or in-memory bytes.
+        fps: Target extraction frame rate.
+        image_size: Width in pixels for the canonical preprocessed frame.
+            Height is derived from the video's aspect ratio and rounded
+            down to a multiple of *patch_size*.
+        patch_size: ViT patch size for height alignment (default 14).
+        max_frames: Stop after this many frames (``None`` = all).
+
+    Yields:
+        ``(global_frame_index, tensor)`` tuples where *tensor* has shape
+        ``[1, 3, H, W]``, dtype float32, values in [0, 1], on CPU.
+
+    Example:
+        >>> for idx, frame in load_and_preprocess_video_stream("video.mp4", fps=5):
+        ...     print(idx, frame.shape)
+        0 torch.Size([1, 3, 294, 518])
+        1 torch.Size([1, 3, 294, 518])
+    """
+    import io
+    import os
+    import tempfile
+
+    import cv2
+
+    # Accept both file paths and in-memory bytes
+    if isinstance(video_source, bytes):
+        tmpdir = tempfile.mkdtemp(prefix="lingbot_vstream_")
+        tmpfile = os.path.join(tmpdir, "upload.mp4")
+        try:
+            with open(tmpfile, "wb") as f:
+                f.write(video_source)
+            yield from _stream_from_capture(
+                tmpfile, fps, image_size, patch_size, max_frames
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    else:
+        yield from _stream_from_capture(
+            video_source, fps, image_size, patch_size, max_frames
+        )
+
+
+def _stream_from_capture(
+    video_path: str,
+    fps: int,
+    image_size: int,
+    patch_size: int,
+    max_frames: int | None,
+) -> "Iterator[tuple[int, torch.Tensor]]":
+    """Core streaming loop — shared by file and bytes paths."""
+    import cv2
+    import numpy as np
+    import torch
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    try:
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        interval = max(1, round(src_fps / fps)) if fps > 0 else 1
+
+        # Determine output resolution from the first frame
+        ret, first_frame = cap.read()
+        if not ret:
+            raise ValueError("Video has no readable frames")
+
+        h, w = first_frame.shape[:2]
+        new_width = image_size
+        new_height = round(h * (new_width / w) / patch_size) * patch_size
+
+        yielded = 0
+        frame_idx = 0
+
+        # Preprocess the first frame we already read
+        tensor = _preprocess_single_frame(
+            first_frame, new_width, new_height, image_size
+        )
+        yield (yielded, tensor)
+        yielded += 1
+        if max_frames is not None and yielded >= max_frames:
+            return
+
+        # Process remaining frames
+        while True:
+            if frame_idx % interval == 0:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                tensor = _preprocess_single_frame(
+                    frame, new_width, new_height, image_size
+                )
+                yield (yielded, tensor)
+                yielded += 1
+                if max_frames is not None and yielded >= max_frames:
+                    break
+            else:
+                if not cap.grab():
+                    break
+            frame_idx += 1
+    finally:
+        cap.release()
+
+
+def _preprocess_single_frame(
+    bgr_frame: "np.ndarray",
+    new_width: int,
+    new_height: int,
+    image_size: int,
+) -> "torch.Tensor":
+    """Resize + crop a single BGR frame to [1, 3, H, W] in [0, 1]."""
+    import cv2
+    import numpy as np
+    import torch
+
+    rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+    tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+
+    if new_height > image_size:
+        start_y = (new_height - image_size) // 2
+        tensor = tensor[:, start_y : start_y + image_size, :]
+
+    return tensor.unsqueeze(0)  # [1, 3, H, W]
