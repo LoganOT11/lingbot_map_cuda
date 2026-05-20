@@ -28,34 +28,34 @@ lingbot_map_cuda/
 │   └── inference.py       # Shared: load_model, postprocess, prepare_for_visualization
 │
 ├── apps/
-│   ├── cli/               # demo.py, gct_profile.py
-│   ├── batch/             # main.py (batch processing), rgbd_scan_render.py
-│   ├── rgbd_render/       # Point-cloud → video offline render pipeline
+│   ├── cli/
+│   │   ├── demo.py        # THE unified pipeline CLI — inference, export, render, viewer
+│   │   └── gct_profile.py # FPS profiling tool
+│   ├── rgbd_render/       # Offline point-cloud → video render pipeline library
+│   │   └── cli.py         # Standalone render CLI (NPZ → video, no inference)
 │   ├── viewer/            # Interactive WebSocket 3D viewer server
 │   └── cuda_ext/          # CUDA kernels (frustum cull, voxelize)
 │
-├── models/                # .pt, .onnx files (gitignored, download separately)
 ├── config/                # YAML presets for render pipeline
-├── example/               # courthouse (286), university, loop, oxford
-├── docs/                  # agent.md, webapp_analysis.md, repo_structure_review.md
+├── example/               # Courthouse (286 frames), university, loop, oxford
 │
-├── demo.py                # Shim → apps/cli/demo.py
-├── gct_profile.py         # Shim → apps/cli/gct_profile.py
-├── demo_render/           # Shims → apps/batch/
+├── demo.py                # Root shim → apps/cli/demo.py
+├── gct_profile.py         # Root shim → apps/cli/gct_profile.py
 └── pyproject.toml
 ```
 
-Backward-compat shims at root delegate to `apps/` via `runpy.run_path()`.
-The core library (`lingbot_map/`) is unchanged — all internal imports remain
-`from lingbot_map.xxx import yyy`.
+**One file to rule them all**: `apps/cli/demo.py` is the single CLI entry point for
+all pipeline stages — inference, NPZ export, video rendering, GLB export, batch
+processing, and interactive 3D visualization.  Root shims (`demo.py`, `gct_profile.py`)
+delegate to `apps/cli/` via `runpy.run_path()`.
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `apps/cli/demo.py` | Main CLI — streaming + windowed inference, viser viewer |
+| `apps/cli/demo.py` | **Unified CLI** — all modes: interactive, headless, render, batch |
 | `apps/cli/gct_profile.py` | FPS profiling tool |
-| `apps/batch/main.py` | Batch processing + offline MP4 rendering |
+| `apps/rgbd_render/cli.py` | Standalone render CLI (NPZ → video, no model needed) |
 | `lingbot_map/inference.py` | Shared `load_model`, `postprocess`, `prepare_for_visualization` |
 | `lingbot_map/models/gct_stream.py` | `GCTStream` + `inference_streaming()` |
 | `lingbot_map/models/gct_stream_window.py` | `GCTStream` + `inference_windowed()` |
@@ -64,6 +64,50 @@ The core library (`lingbot_map/`) is unchanged — all internal imports remain
 | `lingbot_map/utils/geometry.py` | Depth unprojection, SE3 inverse, camera math |
 | `lingbot_map/vis/glb_export.py` | `predictions_to_glb()` — point cloud + cameras → .glb |
 | `lingbot_map/vis/sky_segmentation.py` | ONNX sky segmentation masks |
+
+## demo.py Modes
+
+`apps/cli/demo.py` auto-detects its mode based on which flags are provided:
+
+| Flags | Mode | Description |
+|---|---|---|
+| `--image_folder` / `--video_path` (no export flags) | **Interactive** | Inference → viser 3D viewer |
+| `--image_folder` / `--video_path` + `--headless` | **Headless** | Inference → print summary |
+| `--image_folder` / `--video_path` + `--save_predictions` | **Export** | Inference → per-frame NPZ files |
+| `--image_folder` / `--video_path` + `--render` | **Full pipeline** | Inference → NPZ → video render |
+| `--load_predictions` + `--render` | **Render only** | NPZ → video (no inference) |
+| `--input_folder` + `--output_folder` | **Batch** | Discover scenes → process all |
+| `--load_predictions` + `--visualize_sky_mask_only` | **Sky masks** | Generate sky seg masks |
+
+All render/camera/overlay args from the old `batch_demo.py` are available in the
+unified parser.  A `--config` YAML preset can seed defaults; CLI flags override.
+
+### Common commands
+
+```bash
+# Interactive viewer (streaming inference + viser)
+python demo.py --model_path models/lingbot-map-long.pt --image_folder example/courthouse
+
+# Headless export to NPZ
+python demo.py --model_path models/lingbot-map-long.pt --image_folder example/courthouse \
+    --use_sdpa --first_k 10 --headless --save_predictions outputs/
+
+# Full pipeline: inference + NPZ + video render
+python demo.py --model_path models/lingbot-map-long.pt --video_path video.mp4 \
+    --render outputs/scene.mp4 --camera_mode follow --mask_sky
+
+# Render saved NPZ to video (tweak camera without re-running inference)
+python demo.py --load_predictions outputs/scene/ --render outputs/scene_v2.mp4 \
+    --camera_mode birdeye --config config/indoor.yaml
+
+# Render saved NPZ with render-only CLI (lighter, no torch import)
+python apps/rgbd_render/cli.py --input_npz outputs/scene/ --output_video out.mp4 \
+    --mask_sky --camera_vis default
+
+# Batch process all scenes
+python demo.py --model_path models/lingbot-map-long.pt \
+    --input_folder /data/scenes --output_folder /data/outputs --render
+```
 
 ## Architecture
 
@@ -83,7 +127,8 @@ images → preprocess (518×W, crop) → model.forward()
   → depth [S, H, W, 1] + depth_conf
   → postprocess: pose_enc → extrinsics (3×4) + intrinsics (3×3)
   → unproject: depth + extrinsics → world_points [S, H, W, 3]
-  → export: NPZ, GLB
+  → export: NPZ (per-frame parallel I/O), GLB
+  → render: rgbd_render offline pipeline → MP4
 ```
 
 ### Prediction shapes (16:9, 518×294, S frames)
@@ -99,24 +144,13 @@ images → preprocess (518×W, crop) → model.forward()
 
 - `num_frames ≤ 320` → interval = 1 (every frame cached)
 - `num_frames > 320` → auto `interval = ceil(num_frames / 320)` (RoPE training range)
+- `--flow_threshold > 0` → flow-based keyframe selection (adaptive, takes precedence)
 
-## Working Test Commands
-
-```bash
-# Quick test (5 frames, SDPA, headless)
-python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
-    --image_folder example/courthouse --use_sdpa --first_k 5 --headless
-
-# Full windowed (286 frames, ~1 min, ~5.6 GB peak)
-python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
-    --image_folder example/courthouse --use_sdpa --mode windowed \
-    --window_size 16 --overlap_size 4 --num_scale_frames 4 --offload_to_cpu --headless
-
-# With NPZ export
-python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
-    --image_folder example/courthouse --use_sdpa --first_k 10 --headless \
-    --save_predictions outputs/
-```
+### Memory budget estimation
+`estimate_gpu_memory(resolution, window_frames, backend)` returns predicted
+GPU VRAM breakdown (model, KV cache, special pages, activations).
+At 518×294 with 72-frame window: ~13 GB FlashInfer, ~9 GB SDPA.
+`validate_frame_count()` enforces streaming/windowed caps before inference.
 
 ## Logging
 
@@ -127,3 +161,13 @@ Key messages:
 - `Inference dtype: torch.bfloat16` — dtype selection
 - `Inference done in X s (Y FPS)` — throughput
 - `GPU peak during inference: alloc=X GB` — peak memory
+
+## Test Suite
+
+```bash
+# Run all 164 tests (most run without GPU or model checkpoint)
+conda run -n lingbot-map python -m pytest tests/ -v
+
+# Just the fast unit tests (no model instantiation)
+pytest tests/test_safety_fixes.py tests/test_io_protocol.py tests/test_processor.py -v
+```

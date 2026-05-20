@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# Batch video processing: inference (batch_demo.py) + rendering (rgbd_scan_render.py)
+# Batch video processing: inference (demo.py) + rendering (rgbd_render/cli.py)
 #
 # Usage:
-#   bash examples/process_videos.sh
+#   bash scripts/process_videos.sh
 #
 # Skips videos that already have npz output (safe to re-run).
 # ============================================================================
@@ -20,7 +20,7 @@ MODEL_PATH="/data1/clz/logs/longseq_baseline_1_dinov2_s3_mb/ckpts/checkpoint.pt"
 # GPU
 CUDA_DEVICE=0
 
-# Inference (batch_demo.py)
+# Inference (demo.py)
 TARGET_FRAMES=4000
 MODE="windowed"
 WINDOW_SIZE=64
@@ -31,7 +31,7 @@ IMAGE_STRIDE=1
 SKY_MASK_DIR="${OUTPUT_DIR}/sky_masks"
 SKY_MASK_VIZ_DIR="${OUTPUT_DIR}/sky_mask_viz"
 
-# Rendering (rgbd_scan_render.py)
+# Rendering (rgbd_render/cli.py)
 VOXEL_SIZE=0.001
 VIS_THRESHOLD_RENDER=2.0
 BACK_OFFSET=0.6
@@ -90,8 +90,8 @@ for VIDEO_PATH in "${VIDEOS[@]}"; do
         FRAME_COUNT=$(ls "$NPZ_DIR"/frame_*.npz 2>/dev/null | wc -l)
         echo "  [skip] NPZ already exists ($FRAME_COUNT frames)"
     else
-        echo "  [inference] Running batch_demo.py..."
-        CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python examples/batch_demo.py \
+        echo "  [inference] Running demo.py..."
+        CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python apps/cli/demo.py \
             --video_path "$VIDEO_PATH" \
             --output_folder "$OUTPUT_DIR" \
             --model_path "$MODEL_PATH" \
@@ -100,13 +100,13 @@ for VIDEO_PATH in "${VIDEOS[@]}"; do
             --flow_threshold $FLOW_THRESHOLD \
             --max_non_keyframe_gap $MAX_NON_KEYFRAME_GAP \
             --vis_threshold $VIS_THRESHOLD_INFER \
-            --image_stride $IMAGE_STRIDE \
+            --stride $IMAGE_STRIDE \
             --target_frames $TARGET_FRAMES \
             --mask_sky \
             --sky_mask_dir "$SKY_MASK_DIR" \
             --sky_mask_visualization_dir "$SKY_MASK_VIZ_DIR" \
-            --camera_mode zoom_out \
-            --save_predictions --no_render \
+            --camera_mode follow \
+            --save_predictions \
         || { echo "  [FAILED] inference for $VIDEO_NAME"; FAILED=$((FAILED + 1)); continue; }
     fi
 done
@@ -141,8 +141,8 @@ for VIDEO_PATH in "${VIDEOS[@]}"; do
     if [ -f "$RENDER_OUTPUT" ]; then
         echo "  [skip] Render already exists: $RENDER_OUTPUT"
     else
-        echo "  [render] Running rgbd_scan_render.py..."
-        CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python examples/rgbd_scan_render.py \
+        echo "  [render] Running rgbd_render/cli.py..."
+        CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python apps/rgbd_render/cli.py \
             --input_npz "$NPZ_DIR" \
             --output_video "$RENDER_OUTPUT" \
             --voxel_size $VOXEL_SIZE \
