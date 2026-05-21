@@ -54,7 +54,7 @@ python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --use_sdpa --mode windowed \
     --window_size 16 --overlap_size 4 --num_scale_frames 4 --offload_to_cpu
 
-# Export minimal NPZ (~84 MB for 286 frames)
+# Export NPZ (~50 MB for 286 frames)
 python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --use_sdpa --mode windowed \
     --window_size 16 --num_scale_frames 4 --headless \
@@ -63,20 +63,26 @@ python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
 # Re-open saved NPZ interactively (no model needed)
 python apps/cli/demo.py --load_predictions outputs/courthouse/ \
     --image_folder example/courthouse
+
+# Viewer with sky masking
+python apps/cli/demo.py --load_predictions outputs/courthouse/ \
+    --image_folder example/courthouse --mask_sky
 ```
 
 ## NPZ Format
 
-Per-frame files (`frame_000000.npz`) + `meta.npz`. Parallel I/O via ThreadPoolExecutor.
+Per-frame files (`frame_000000.npz`) + `meta.npz`. Uses `np.savez_compressed`
+(DEFLATE) with parallel I/O via ThreadPoolExecutor. 286-frame courthouse: **50 MB**.
 
-| Key | Dtype | Size/frame (518×294) | Notes |
+| Key | Dtype | Raw/frame (518×294) | Notes |
 |---|---|---|---|
-| `depth` | **float16** | 298 KB | Upcast to float32 on load |
+| `depth` | float16 | 298 KB | Lossless; upcast to float32 on load |
+| `depth_conf` | **uint8** | 149 KB | Quantized from float16 (±0.5 max error). Used for confidence-based point filtering in viewer |
 | `extrinsic` | float32 | 48 B | Camera-to-world 3×4 |
 | `intrinsic` | float32 | 36 B | 3×3 intrinsics |
 | `images` | uint8 | 446 KB | Only with `--save_images` |
 
-Dropped: `depth_conf`, `pose_enc` (redundant).
+Dropped: `pose_enc` (redundant with extrinsic+intrinsic).
 
 ## Comparing NPZ Exports
 
@@ -106,6 +112,7 @@ Reports per-key: mean |Δ|, max |Δ|, mean |Δ|%, quartiles. Use for quantifying
 
 | File | Purpose |
 |---|---|
+| `lingbot_map/io_protocol.py` | I/O abstractions (FrameSource, PredictionSink, NPZDirectorySink) |
 | `lingbot_map/inference.py` | `load_model`, `postprocess`, `prepare_for_visualization` |
 | `lingbot_map/models/gct_stream.py` | `GCTStream` + `inference_streaming()` |
 | `lingbot_map/models/gct_stream_window.py` | `GCTStream` + `inference_windowed()` |
@@ -113,3 +120,4 @@ Reports per-key: mean |Δ|, max |Δ|, mean |Δ|%, quartiles. Use for quantifying
 | `lingbot_map/vis/point_cloud_viewer.py` | Interactive viser 3D viewer |
 | `lingbot_map/vis/sky_segmentation.py` | ONNX sky segmentation |
 | `apps/rgbd_render/cli.py` | Standalone render CLI (NPZ → MP4) |
+| `apps/cli/demo.py` | Unified pipeline CLI — NPZ save/load, viewer, render |
