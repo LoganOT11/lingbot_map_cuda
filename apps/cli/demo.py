@@ -170,7 +170,9 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--render", type=str, default=None, const=".", nargs="?",
                      help="Render predictions to video (optional output path or directory)")
     out.add_argument("--save_predictions", type=str, default=None, const=".", nargs="?",
-                     help="Save predictions as per-frame NPZ files")
+                     help="Save predictions as per-frame NPZ files (minimal: depth+extrinsic+intrinsic)")
+    out.add_argument("--save_images", action="store_true",
+                     help="Also embed preprocessed images in NPZ (needed for offline rendering)")
     out.add_argument("--save_glb", action="store_true",
                      help="Export GLB 3D model alongside other outputs")
     out.add_argument("--headless", action="store_true",
@@ -184,7 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     vis.add_argument("--port", type=int, default=8080)
     vis.add_argument("--conf_threshold", type=float, default=1.5,
                      help="Confidence threshold for viser viewer point filtering")
-    vis.add_argument("--downsample_factor", type=int, default=10)
+    vis.add_argument("--downsample_factor", type=int, default=5,
+                     help="Point downsampling factor for viewer and render")
     vis.add_argument("--point_size", type=float, default=0.00001)
 
     # ── Render pipeline ──
@@ -242,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Scene (render pipeline) ──
     scn = p.add_argument_group("Scene")
     scn.add_argument("--voxel_size", type=float, default=None)
-    scn.add_argument("--downsample_factor", type=int, default=5)
+
     scn.add_argument("--keyframes_only_points", action="store_true")
     scn.add_argument("--max_render_points", type=int, default=1_000_000_000)
     scn.add_argument("--vis_threshold", type=float, default=1.5,
@@ -688,6 +691,17 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    # Convert torch tensors to numpy (postprocess returns CPU tensors, not ndarrays)
+    _clean: dict = {}
+    for k, v in predictions.items():
+        if isinstance(v, torch.Tensor):
+            _clean[k] = v.detach().cpu().numpy()
+        elif isinstance(v, np.ndarray):
+            _clean[k] = v
+        else:
+            _clean[k] = v
+    predictions = _clean
+
     dir_path = output_path
     if dir_path.endswith('.npz'):
         dir_path = dir_path[:-4]
@@ -702,11 +716,15 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
     os.makedirs(dir_path, exist_ok=True)
 
     # Separate sequence arrays from metadata
+    # Skip redundant keys: depth_conf (noisy), pose_enc (redundant with extrinsic)
     seq_keys = []
     meta_dict = {}
     S = None
+    _SKIP_KEYS = {'depth_conf', 'confidence', 'pose_enc'}
     for key, value in predictions.items():
         if not isinstance(value, np.ndarray):
+            continue
+        if key in _SKIP_KEYS:
             continue
         if value.ndim >= 2 and S is None:
             S = value.shape[0]
@@ -722,7 +740,16 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
         return dir_path
 
     def _save_frame(frame_idx):
-        frame_dict = {key: predictions[key][frame_idx] for key in seq_keys}
+        frame_dict = {}
+        for key in seq_keys:
+            val = predictions[key][frame_idx]
+            # Store depth as float16 (half precision, 2× smaller, sufficient for viz)
+            if key == 'depth' and val.dtype == np.float32:
+                val = val.astype(np.float16)
+            # Store images as uint8 (4× smaller than float32)
+            if key == 'images' and val.dtype == np.float32:
+                val = (val * 255).clip(0, 255).astype(np.uint8)
+            frame_dict[key] = val
         np.savez(os.path.join(dir_path, f"frame_{frame_idx:06d}.npz"), **frame_dict)
 
     n_workers = min(32, S)
@@ -737,7 +764,11 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
 
 
 def _load_predictions_from_npz(input_path: str) -> dict:
-    """Load predictions from NPZ directory or single file."""
+    """Load predictions from NPZ directory or single file.
+
+    Returns a dict with numpy arrays.  If depth was saved as float16, it is
+    upcast to float32.  Images may be absent (not saved by default).
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     if os.path.isdir(input_path):
@@ -771,8 +802,13 @@ def _load_predictions_from_npz(input_path: str) -> dict:
         all_keys = list(frame_dicts[0].keys())
         predictions = {}
         for key in all_keys:
-            predictions[key] = np.stack([fd[key] for fd in frame_dicts], axis=0)
+            arr = np.stack([fd[key] for fd in frame_dicts], axis=0)
+            # Upcast float16 depth to float32 for the viewer/renderer
+            if key == 'depth' and arr.dtype == np.float16:
+                arr = arr.astype(np.float32)
+            predictions[key] = arr
 
+        # Load metadata if present
         meta_path = os.path.join(input_path, 'meta.npz')
         if os.path.exists(meta_path):
             meta = np.load(meta_path, allow_pickle=True)
@@ -1083,10 +1119,10 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
     validate_frame_count(num_frames, args.mode)
 
     # ── Prepare ──
-    images = images.to(device)
+    # Keep images on CPU; inference methods move per-window slices to GPU just-in-time.
     if device.type == "cuda":
         images = images.pin_memory() if not images.is_pinned() else images
-    _log.info("Images on %s, shape %s", device, tuple(images.shape))
+    _log.info("Images on %s, shape %s", images.device, tuple(images.shape))
     _auto_keyframe_interval(args, num_frames)
 
     # ── Compile warmup ──
@@ -1103,6 +1139,15 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
     predictions, images_cpu = _postprocess(predictions, images_for_post)
 
     # ── Export ──
+    # Attach images to predictions for NPZ only if --save_images is set.
+    # Images are large (~1.7 MB/frame float32) and can be regenerated from
+    # the original folder, so we skip them by default.
+    # Note: images_cpu may have a leading batch dim (1, S, 3, H, W) — squeeze it.
+    if getattr(args, 'save_images', False):
+        imgs = images_cpu
+        if imgs.ndim == 5 and imgs.shape[0] == 1:
+            imgs = imgs[0]  # strip batch dim
+        predictions["images"] = imgs
     npz_dir = None
     if outs.get('npz'):
         npz_dir = _save_predictions_npz(predictions, outs['npz'])
@@ -1131,10 +1176,11 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
 
 
 def _run_load_predictions_mode(args) -> int:
-    """Render or visualize saved NPZ predictions (no inference)."""
-    from lingbot_map.vis.sky_segmentation import load_or_create_sky_masks
+    """Handle --load_predictions: render to video, visualize sky masks, or launch interactive viewer."""
 
+    # ── Sky mask only ──
     if args.visualize_sky_mask_only:
+        from lingbot_map.vis.sky_segmentation import load_or_create_sky_masks
         _log.info("Sky mask visualization only mode")
         for npz_path in args.load_predictions:
             predictions = _load_predictions_from_npz(npz_path)
@@ -1142,8 +1188,7 @@ def _run_load_predictions_mode(args) -> int:
             sky_dir, sky_viz_dir = _resolve_sky_artifact_dirs(args, name)
             _log.info("Generating sky masks for %s...", name)
             load_or_create_sky_masks(
-                image_folder=None,
-                image_paths=None,
+                image_folder=None, image_paths=None,
                 images=predictions.get("images"),
                 skyseg_model_path=args.skyseg_model_path,
                 sky_mask_dir=sky_dir,
@@ -1153,18 +1198,78 @@ def _run_load_predictions_mode(args) -> int:
             _log.info("Sky masks saved.")
         return 0
 
-    # Render mode
-    args.use_per_scene_sky_dirs = len(args.load_predictions) > 1
-    for npz_path in args.load_predictions:
-        if not os.path.exists(npz_path):
-            _log.error("NPZ path not found: %s", npz_path)
-            continue
-        name = os.path.splitext(os.path.basename(npz_path.rstrip('/')))[0]
-        base = args.output_folder or "."
-        os.makedirs(base, exist_ok=True)
-        video_path = args.render if args.render and args.render != "." else os.path.join(base, f"{name}{args.video_suffix}.mp4")
-        _log.info("Rendering %s → %s", npz_path, video_path)
-        _render_npz(npz_path, video_path, args, artifact_name=name)
+    # ── Render mode ──
+    if args.render is not None:
+        args.use_per_scene_sky_dirs = len(args.load_predictions) > 1
+        for npz_path in args.load_predictions:
+            if not os.path.exists(npz_path):
+                _log.error("NPZ path not found: %s", npz_path)
+                continue
+
+            # Check that images are present (render pipeline requires them)
+            predictions = _load_predictions_from_npz(npz_path)
+            if "images" not in predictions:
+                _log.error(
+                    "NPZ '%s' has no images. Re-save with --save_images, or provide "
+                    "--image_folder to reload originals.", npz_path)
+                continue
+
+            name = os.path.splitext(os.path.basename(npz_path.rstrip('/')))[0]
+            base = args.output_folder or "."
+            os.makedirs(base, exist_ok=True)
+            video_path = args.render if args.render != "." else os.path.join(
+                base, f"{name}{args.video_suffix}.mp4")
+            _log.info("Rendering %s → %s", npz_path, video_path)
+            _render_npz(npz_path, video_path, args, artifact_name=name)
+        return 0
+
+    # ── Interactive viewer mode (--load_predictions without --render) ──
+    # Load the first NPZ path and launch the viewer.
+    npz_path = args.load_predictions[0]
+    if not os.path.exists(npz_path):
+        _log.error("NPZ path not found: %s", npz_path)
+        return 1
+
+    _log.info("Loading predictions for interactive viewer...")
+    predictions = _load_predictions_from_npz(npz_path)
+
+    # If images are missing from NPZ, reload from --image_folder
+    if "images" not in predictions:
+        if not args.image_folder:
+            _log.error(
+                "NPZ has no images and --image_folder not provided. "
+                "Either re-save with --save_images, or pass --image_folder to reload originals.")
+            return 1
+        _log.info("Images not in NPZ — reloading from %s...", args.image_folder)
+        paths = _list_image_paths(args.image_folder, args.image_extension)
+        paths = _apply_image_filters(paths, args.first_k, args.last_k, args.stride)
+        if not paths:
+            _log.error("No images found in %s", args.image_folder)
+            return 1
+        # Only load as many frames as the NPZ contains
+        S = predictions["depth"].shape[0] if "depth" in predictions else len(paths)
+        if len(paths) > S:
+            _log.info("NPZ has %d frames, limiting reload to first %d of %d images", S, S, len(paths))
+            paths = paths[:S]
+        # Load and preprocess to match depth dimensions
+        reloaded = load_and_preprocess_images(
+            paths, mode="crop", image_size=args.image_size, patch_size=args.patch_size,
+        )
+        predictions["images"] = reloaded.numpy()
+        _log.info("Reloaded %d images, shape %s", len(paths), reloaded.shape)
+
+    # Prepare for viewer (handle both raw model output and NPZ-loaded data)
+    images_cpu = predictions.get("images")
+    if isinstance(images_cpu, torch.Tensor):
+        images_cpu = images_cpu.detach().cpu()
+
+    # Ensure images are in (S, 3, H, W) float32 [0,1] format for viewer
+    if isinstance(images_cpu, np.ndarray):
+        images_cpu = torch.from_numpy(images_cpu.astype(np.float32))
+    if images_cpu.max() > 1.0:
+        images_cpu = images_cpu / 255.0
+
+    _launch_viewer(predictions, images_cpu, args, args.image_folder or "")
     return 0
 
 
