@@ -247,6 +247,52 @@ class AggregatorStream(AggregatorBase):
         self._cached_pos3d = None
         logger.info("KV cache cleaned")
 
+    def snapshot_kv_cache(self):
+        """Return a deep-copy of the SDPA KV cache state.
+
+        Only works for SDPA (dict-based).  Returns None for FlashInfer.
+        """
+        if not self.use_sdpa or not self.kv_cache:
+            return None
+        snap = {}
+        for k, v in self.kv_cache.items():
+            if v is not None and isinstance(v, torch.Tensor):
+                snap[k] = v.clone()
+            else:
+                snap[k] = v
+        return snap
+
+    def restore_kv_cache(self, snapshot: dict | None):
+        """Restore a previously snapshotted SDPA KV cache."""
+        if snapshot is None or not self.use_sdpa:
+            return
+        for k, v in snapshot.items():
+            if v is not None and isinstance(v, torch.Tensor):
+                self.kv_cache[k] = v.clone()
+            else:
+                self.kv_cache[k] = v
+
+    def trim_kv_cache(self, num_frames_to_keep: int, tokens_per_frame: int):
+        """Trim SDPA KV cache to keep only the last *num_frames_to_keep* frames.
+
+        Only works with SDPA.  Has no effect on FlashInfer.
+        KV shape: [B, num_heads, num_frames, tokens_per_frame, head_dim]
+        """
+        if not self.use_sdpa or num_frames_to_keep <= 0:
+            self.clean_kv_cache()
+            return
+        for key in list(self.kv_cache.keys()):
+            if key == "_skip_append":
+                continue
+            val = self.kv_cache[key]
+            if val is None or not isinstance(val, torch.Tensor):
+                continue
+            # val shape: [B, H, num_frames, tokens_per_frame|num_special, D]
+            if val.dim() >= 3 and val.shape[2] > num_frames_to_keep:
+                self.kv_cache[key] = val[:, :, -num_frames_to_keep:].contiguous()
+        self.total_frames_processed = num_frames_to_keep
+        self._cached_pos3d = None  # invalidate stale 3D RoPE cache
+
     def _init_3d_rope(self):
         """Initialize 3D RoPE for streaming inference."""
         if not self.enable_3d_rope:

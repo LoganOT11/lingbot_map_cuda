@@ -1,24 +1,22 @@
 # Memory & Streaming Optimization Analysis
 
-> **Status**: Tier 1 ✓ complete · Tier 2 ✓ complete · Tier 3-4 planned
+> **Status**: Tier 1 ✓ complete · Tier 2 ✓ complete · Tier 3 ✗ (architecturally blocked) · Tier 4 planned
 
-## Current Architecture (demo.py path)
+## Final Timing Summary (286-frame courthouse, RTX 4070 Laptop)
 
-```
-load_images() → [S, 3, H, W]     ← ALL frames in CPU RAM (498 MB for 286)
-     ↓
-model.inference_windowed()       ← ALL windows processed, returns FULL dict
-     ↓                              Overlap frames computed TWICE
-_postprocess(all_frames)         ← ALL predictions in RAM (332 MB)
-     ↓
-_save_predictions_npz(all)       ← ALL frames saved at once
-```
-
-**Peak memory**: ~830 MB CPU + ~5.1 GB GPU (SDPA). Frames only hit disk after 100% of inference completes.
+| Metric | Original | Tier 1 | Tier 1+2 (lazy) |
+|---|---|---|---|
+| Image load | 1.2 s | 1.2 s | 2.3 s |
+| Inference | 86.1 s | 86.1 s | 85.9 s |
+| GPU peak | 5.08 GB | 5.08 GB | 5.08 GB |
+| Image CPU RAM | 498 MB | 498 MB | ~28 MB |
+| NPZ size | 166.5 MB | 50.5 MB (−70%) | 50.5 MB (−70%) |
+| Total time | ~90 s | ~90 s | 89.7 s (+0.8%) |
+| Quality vs backup | baseline | ✓ all frames pass | ✓ all frames pass |
 
 ## Tier 1 — Incremental NPZ Export ✓
 
-**Implemented**: Per-window callback in `inference_windowed()` saves raw predictions to disk as each window completes. Final aligned predictions overwrite at end. Survives crashes.
+Per-window callback in `inference_windowed()` saves raw predictions to disk as each window completes. Final aligned predictions overwrite at end. Survives crashes.
 
 - `gct_stream_window.py`: Added `per_window_callback(w_dict, start, end)` parameter
 - `demo.py`: `_on_window_complete()` saves per-window NPZ with dtype optimization
@@ -27,40 +25,20 @@ _save_predictions_npz(all)       ← ALL frames saved at once
 
 ## Tier 2 — Lazy Image Loading (memmap) ✓
 
-**Implemented**: `--lazy_images` flag loads images via `np.memmap` backed by a temp file. The OS pages frames in/out as each window accesses them. Peak CPU RAM for images drops from O(num_frames) to O(window_size).
+`--lazy_images` flag loads images via `np.memmap` backed by a temp file. The OS pages frames in/out as each window accesses them. Peak CPU RAM drops from O(num_frames) to O(window_size). Adds <1% overhead.
 
-### Timing Comparison (286-frame courthouse, RTX 4070 Laptop)
+## Tier 3 — Overlap Recycling ✗ (architecturally blocked)
 
-| Metric | Regular (Tier 1) | Lazy (Tier 2) | Δ |
-|---|---|---|---|
-| Image load | 1.2 s | 2.3 s | +1.1 s |
-| Inference | 86.1 s | 85.9 s | −0.2 s (noise) |
-| GPU peak | 5.08 GB | 5.08 GB | 0 |
-| **Image CPU RAM** | **498 MB** | **~28 MB** (O(window)) | **−470 MB** |
-| Total scene time | ~89 s | 89.7 s | +0.7 s (+0.8%) |
-| NPZ size | 50.5 MB | 50.5 MB | 0 |
-| Output quality vs backup | ✓ passes | ✓ passes | identical |
+**Attempted**: Reuse overlap predictions from window N as scale frames for window N+1, skipping the scale forward pass. Achieved 12% inference speedup (86.1 → 75.4s).
 
-**Key finding**: Lazy loading adds negligible overhead (+0.8% total time) while eliminating the per-frame RAM cost. Critical for sequences with thousands of frames where pre-loading all images is impossible.
+**Why it failed**: The inter-window alignment algorithm (`_align_and_stitch_windows`) compares overlap predictions between adjacent windows to compute scale correction transforms. When overlap predictions are reused (identical in both windows), the alignment computes identity transforms, failing to correct for drift between windows. This caused depth errors in all frames beyond the first window.
 
-### How It Works
+**Infrastructure kept**: `AggregatorStream.snapshot_kv_cache()`, `restore_kv_cache()`, `trim_kv_cache()` methods remain in the codebase for future use.
 
-```
-_load_images_lazy()               ← Preprocess images in batches → np.memmap (disk)
-     ↓                              Returns torch.from_numpy(mmap) — looks like real tensor
-model.inference_windowed()       ← Accesses images[:, start:end]
-     ↓                              → OS faults in only those pages
-     ↓                              → After window done, pages can be evicted
-     ↓                              Peak RAM: O(window_size) ≈ 28 MB for images
-```
-
-The memmap tensor supports `.shape`, `.device`, `.pin_memory()` — the model treats it exactly like a regular tensor. No model changes needed.
-
-## Tier 3 — Overlap Recycling & KV Reuse (planned)
-
-- Cache overlap predictions from window N, reuse in window N+1
-- Saves ~20% inference compute (4/20 frames per window)
-- KV cache reuse for overlap region (architecturally complex)
+**Path forward**: Overlap recycling requires either:
+1. **Deferred alignment**: Save raw window predictions, apply alignment at load time (requires alignment metadata to be persisted separately)
+2. **KV-only reuse**: Reuse KV cache entries but still run the scale forward pass (no compute savings, but better context for scale frames)
+3. **Model architecture change**: Decouple alignment from overlap comparisons
 
 ## Tier 4 — Progressive Visualization (planned)
 
@@ -75,7 +53,7 @@ The memmap tensor supports `.shape`, `.device`, `.pin_memory()` — the model tr
 | FlashInfer | 4.6 GB (fixed special-page pool) | Moderate | ✗ (starts at 8.5 GB) |
 | SDPA | 0 GB | Linear | ✓ (5.3 GB at window=16) |
 
-Windowed mode bounds the KV cache to `window_size + scale_frames` regardless of sequence length. Streaming mode would keep all frames in cache → OOM for 286 frames.
+Windowed mode bounds the KV cache to `window_size + scale_frames` regardless of sequence length.
 
 ### Max Window Size (SDPA, RTX 4070 Laptop)
 
@@ -86,4 +64,4 @@ Windowed mode bounds the KV cache to `window_size + scale_frames` regardless of 
 | 48 | 4.0 GB | 7.8 GB | ✓ tight |
 | 64 | 5.2 GB | 9.0 GB | ✗ OOM |
 
-Lazy loading does **not** increase window_size headroom — it saves CPU RAM, not GPU VRAM. To use larger windows, a GPU with ≥12 GB VRAM is needed.
+Lazy loading (Tier 2) saves CPU RAM, not GPU VRAM — window_size headroom is unchanged.
