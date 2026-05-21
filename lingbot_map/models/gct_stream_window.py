@@ -968,6 +968,7 @@ class GCTStream(GCTBase):
         keyframe_interval: int = 1,
         flow_threshold: float = 0.0,
         max_non_keyframe_gap: int = 30,
+        per_window_callback: Optional[callable] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Windowed inference with keyframe detection and cross-window alignment.
@@ -1009,6 +1010,12 @@ class GCTStream(GCTBase):
                 (takes precedence over ``keyframe_interval``).
             max_non_keyframe_gap: Max consecutive non-keyframe frames before
                 forcing a keyframe (flow mode only).
+
+            per_window_callback: Optional callable(w_dict, start, end) fired after
+                each window's predictions are assembled (before alignment).
+                Use for incremental saving / streaming.  *w_dict* contains
+                per-window keys (pose_enc, depth, depth_conf, frame_type, …)
+                with leading batch dim = 1.
 
         Returns:
             Merged prediction dict with all frames.
@@ -1170,7 +1177,10 @@ class GCTStream(GCTBase):
                     cursor += 1
                     pbar.update(1)
 
-                all_window_predictions.append(_make_window_pred(w_lists))
+                w_pred = _make_window_pred(w_lists)
+                if per_window_callback:
+                    per_window_callback(w_pred, window_start, cursor)
+                all_window_predictions.append(w_pred)
                 window_idx += 1
 
                 # Next window starts overlap_size frames back (= scale frames)
@@ -1255,7 +1265,10 @@ class GCTStream(GCTBase):
                     w_lists['frame_type'].append(1 if is_keyframe else 2)
                     del frame_out
 
-                all_window_predictions.append(_make_window_pred(w_lists))
+                w_pred = _make_window_pred(w_lists)
+                if per_window_callback:
+                    per_window_callback(w_pred, start, end)
+                all_window_predictions.append(w_pred)
 
         # Store for merge helpers
         self._last_window_size = eff_overlap  # not used directly, but kept for compat

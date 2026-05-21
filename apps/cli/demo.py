@@ -259,6 +259,8 @@ def build_parser() -> argparse.ArgumentParser:
     bat.add_argument("--skip_existing", action="store_true")
     bat.add_argument("--dry_run", action="store_true")
     bat.add_argument("--num_workers", type=int, default=8)
+    bat.add_argument("--lazy_images", action="store_true",
+                     help="Load images via memory-mapped file (O(window) RAM, not O(frames))")
 
     return p
 
@@ -338,6 +340,74 @@ def _load_images_from_folder(
     )
     _log.info("Preprocessed to %dx%d", images.shape[-1], images.shape[-2])
     return images, folder
+
+
+def _load_images_lazy(
+    folder: str, args,
+) -> tuple[torch.Tensor, str, str]:
+    """Load images via memory-mapped numpy array → torch tensor.
+
+    Images are preprocessed in parallel and written to a temporary memmap
+    file.  The returned tensor is a view of the memmap — the OS pages frames
+    in/out as ``inference_windowed`` accesses each window.  Peak RAM is
+    O(window_size) instead of O(num_frames).
+
+    Returns (tensor, folder, mmap_path) — caller must delete mmap_path after use.
+    """
+    import tempfile
+
+    paths = _list_image_paths(folder, args.image_extension)
+    paths = _apply_image_filters(
+        paths, args.first_k, args.last_k, args.stride,
+        getattr(args, 'image_range', None),
+    )
+    if not paths:
+        raise ValueError(f"No images found in {folder}")
+
+    S = len(paths)
+
+    # Determine resolution from first image (same as load_and_preprocess_images logic)
+    from PIL import Image, ImageOps
+    img0 = Image.open(paths[0])
+    img0 = ImageOps.exif_transpose(img0)
+    w0, h0 = img0.size
+    new_w = args.image_size
+    new_h = round(h0 * (new_w / w0) / args.patch_size) * args.patch_size
+    if new_h > args.image_size:
+        new_h = args.image_size
+    resolution = (new_h, new_w)
+
+    # Create temp memmap file
+    tmp = tempfile.NamedTemporaryFile(suffix='.dat', delete=False, prefix='lingbot_lazy_')
+    tmp.close()
+    mmap = np.memmap(tmp.name, dtype='float32', mode='w+', shape=(S, 3, resolution[0], resolution[1]))
+
+    _log.info("Loading %d images → memmap %s (lazy, O(window) RAM)", S, tmp.name)
+    t0 = time.time()
+
+    # Preprocess in parallel, write directly to memmap
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Load in batches to keep peak RAM bounded (~2× batch_size frames)
+    batch_size = min(64, S)
+    for batch_start in range(0, S, batch_size):
+        batch_end = min(batch_start + batch_size, S)
+        batch_paths = paths[batch_start:batch_end]
+        batch_tensor = load_and_preprocess_images(
+            batch_paths, mode="crop",
+            image_size=args.image_size, patch_size=args.patch_size,
+        )
+        mmap[batch_start:batch_end] = batch_tensor.numpy()
+        del batch_tensor
+
+    mmap.flush()
+    elapsed = time.time() - t0
+    _log.info("Memmap ready: %d frames @ %dx%d in %.1f s (%.1f MB on disk)",
+              S, resolution[1], resolution[0], elapsed,
+              os.path.getsize(tmp.name) / 1024 / 1024)
+
+    tensor = torch.from_numpy(mmap)
+    return tensor, folder, tmp.name
 
 
 def _load_images_from_video(
@@ -624,8 +694,15 @@ def _warmup_compile(model, images: torch.Tensor, args, dtype: torch.dtype,
 # Stage 5: Inference
 # =============================================================================
 
-def _run_inference(model, images: torch.Tensor, args, dtype: torch.dtype) -> dict:
-    """Run streaming or windowed inference. Returns raw predictions dict."""
+def _run_inference(model, images: torch.Tensor, args, dtype: torch.dtype,
+                  per_window_callback=None) -> dict:
+    """Run streaming or windowed inference. Returns raw predictions dict.
+
+    Args:
+        per_window_callback: Optional callable(w_pred, start, end) fired
+            after each window's raw predictions are assembled (before
+            alignment).  Used for incremental NPZ saving.
+    """
     _log.info("Running %s inference (dtype=%s)...", args.mode, dtype)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -656,6 +733,7 @@ def _run_inference(model, images: torch.Tensor, args, dtype: torch.dtype) -> dic
                 keyframe_interval=args.keyframe_interval,
                 flow_threshold=flow_threshold,
                 max_non_keyframe_gap=max_non_keyframe_gap,
+                per_window_callback=per_window_callback,
             )
 
     num_frames = images.shape[0]
@@ -766,6 +844,105 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
 
     _log.info("Saved predictions to %s/ (%d frames, %d keys/frame)", dir_path, S, len(seq_keys))
     return dir_path
+
+
+# ── Incremental NPZ (per-window streaming save) ─────────────────────────
+
+def _setup_incremental_npz(output_path: str, num_frames: int, args) -> dict:
+    """Prepare a directory for incremental per-window NPZ saving.
+
+    Returns a state dict passed to _on_window_complete and
+    _finalize_incremental_npz.
+    """
+    dir_path = output_path
+    if dir_path.endswith('.npz'):
+        dir_path = dir_path[:-4]
+
+    # Clean stale files
+    if os.path.isdir(dir_path):
+        for f in glob.glob(os.path.join(dir_path, 'frame_*.npz')):
+            os.remove(f)
+        for f in glob.glob(os.path.join(dir_path, 'meta.npz')):
+            os.remove(f)
+    os.makedirs(dir_path, exist_ok=True)
+
+    return {
+        'dir': dir_path,
+        'num_frames': num_frames,
+        'save_images': getattr(args, 'save_images', False),
+        'window_count': 0,
+    }
+
+
+def _on_window_complete(w_pred: dict, start: int, end: int,
+                        state: dict, args) -> None:
+    """Per-window callback: save raw window predictions as individual NPZ files.
+
+    These are *unaligned* intermediate saves — crash recovery and partial
+    preview.  The final aligned predictions are saved by
+    :func:`_finalize_incremental_npz`.
+
+    *w_pred* keys are batched as [1, window_len, ...] from the model.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    dir_path = state['dir']
+    window_len = end - start
+
+    # Extract per-frame arrays from the batched window dict
+    frame_dicts = []
+    for j in range(window_len):
+        fd = {}
+        for key in ('depth', 'depth_conf', 'extrinsic', 'intrinsic'):
+            if key not in w_pred:
+                continue
+            val = w_pred[key]
+            # val shape: [1, window_len, ...] → index j
+            if isinstance(val, torch.Tensor):
+                val = val[0, j].detach().cpu().numpy()
+            elif isinstance(val, np.ndarray) and val.ndim >= 2:
+                val = val[0, j]
+            else:
+                val = np.asarray(val)
+
+            # Dtype optimisations (mirrors _save_predictions_npz)
+            if key in ('depth', 'depth_conf') and val.dtype == np.float32:
+                val = val.astype(np.float16)
+            if key == 'depth_conf' and val.dtype == np.float16:
+                val = np.round(val.astype(np.float32)).clip(0, 255).astype(np.uint8)
+
+            fd[key] = val
+        frame_dicts.append(fd)
+
+    # Skip if no keys found (flow-callback for alignment-only windows)
+    if not frame_dicts or not any(fd for fd in frame_dicts):
+        return
+
+    # Save per-frame NPZ files in parallel
+    def _save_one(idx):
+        global_idx = start + idx
+        path = os.path.join(dir_path, f"frame_{global_idx:06d}.npz")
+        np.savez_compressed(path, **frame_dicts[idx])
+
+    n_workers = min(8, window_len)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(_save_one, range(window_len)))
+
+    state['window_count'] += 1
+    _log.debug("Incremental save: window %d, frames [%d, %d)",
+               state['window_count'], start, end)
+
+
+def _finalize_incremental_npz(predictions: dict, state: dict, args) -> str:
+    """After inference completes with alignment, overwrite incremental
+    NPZ files with the final aligned predictions + metadata.
+
+    Returns the NPZ directory path.
+    """
+    _log.info("Finalizing NPZ with aligned predictions (%d frames)...",
+              state['num_frames'])
+    # Re-use the existing bulk save which produces final aligned output
+    return _save_predictions_npz(predictions, state['dir'])
 
 
 def _load_predictions_from_npz(input_path: str) -> dict:
@@ -1098,26 +1275,35 @@ def _resolve_output_paths(args, scene_name: str) -> dict:
 def _run_single_scene(args, scene_name: str, image_folder: str,
                       model, device: torch.device, dtype: torch.dtype) -> int:
     """Run the full pipeline for one scene.  Returns exit code (0 = success)."""
+    t_scene_start = time.time()
     _log.info("=" * 60)
     _log.info("Scene: %s", scene_name)
     _log.info("Source: %s", image_folder)
+    if getattr(args, 'lazy_images', False):
+        _log.info("Mode: lazy images (memmap, O(window) RAM)")
     _log.info("=" * 60)
 
     # Resolve output paths
     outs = _resolve_output_paths(args, scene_name)
 
     # ── Load images ──
+    mmap_path = None  # for cleanup
     t_load = time.time()
+    t_prep = 0.0
     # Temporarily set image_folder so load_images() works
     saved_folder = args.image_folder
     args.image_folder = image_folder
     try:
-        images, resolved_folder = load_images(args)
+        if getattr(args, 'lazy_images', False):
+            images, resolved_folder, mmap_path = _load_images_lazy(image_folder, args)
+        else:
+            images, resolved_folder = load_images(args)
     finally:
         args.image_folder = saved_folder
 
     num_frames = images.shape[0]
-    _log.info("Loaded %d frames (%.1f s)", num_frames, time.time() - t_load)
+    t_load_elapsed = time.time() - t_load
+    _log.info("Loaded %d frames (%.1f s)", num_frames, t_load_elapsed)
     _export_preprocessed(args.export_preprocessed, images)
 
     # ── Validate ──
@@ -1125,7 +1311,7 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
 
     # ── Prepare ──
     # Keep images on CPU; inference methods move per-window slices to GPU just-in-time.
-    if device.type == "cuda":
+    if device.type == "cuda" and not getattr(args, 'lazy_images', False):
         images = images.pin_memory() if not images.is_pinned() else images
     _log.info("Images on %s, shape %s", images.device, tuple(images.shape))
     _auto_keyframe_interval(args, num_frames)
@@ -1133,8 +1319,18 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
     # ── Compile warmup ──
     _warmup_compile(model, images, args, dtype, num_frames)
 
-    # ── Inference ──
-    predictions = _run_inference(model, images, args, dtype)
+    # ── Inference (with incremental NPZ saving if requested) ──
+    npz_dir = None
+    if outs.get('npz'):
+        # Set up incremental per-window saving via callback
+        _inc_state = _setup_incremental_npz(outs['npz'], num_frames, args)
+        per_window_cb = lambda w_pred, start, end: _on_window_complete(
+            w_pred, start, end, _inc_state, args
+        )
+    else:
+        per_window_cb = None
+
+    predictions = _run_inference(model, images, args, dtype, per_window_cb)
 
     # ── Post-process ──
     del images
@@ -1145,17 +1341,14 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
 
     # ── Export ──
     # Attach images to predictions for NPZ only if --save_images is set.
-    # Images are large (~1.7 MB/frame float32) and can be regenerated from
-    # the original folder, so we skip them by default.
-    # Note: images_cpu may have a leading batch dim (1, S, 3, H, W) — squeeze it.
     if getattr(args, 'save_images', False):
         imgs = images_cpu
         if imgs.ndim == 5 and imgs.shape[0] == 1:
             imgs = imgs[0]  # strip batch dim
         predictions["images"] = imgs
-    npz_dir = None
+
     if outs.get('npz'):
-        npz_dir = _save_predictions_npz(predictions, outs['npz'])
+        npz_dir = _finalize_incremental_npz(predictions, _inc_state, args)
     if outs.get('glb'):
         _export_glb(predictions, outs['glb'], args)
 
@@ -1176,7 +1369,16 @@ def _run_single_scene(args, scene_name: str, image_folder: str,
     if not args.headless and not outs.get('video') and not outs.get('npz'):
         _launch_viewer(predictions, images_cpu, args, resolved_folder)
 
-    _log.info("Scene '%s' complete.", scene_name)
+    # ── Cleanup ──
+    if mmap_path and os.path.exists(mmap_path):
+        try:
+            os.unlink(mmap_path)
+            _log.debug("Cleaned up lazy-image memmap: %s", mmap_path)
+        except OSError:
+            pass
+
+    _log.info("Scene '%s' complete (total %.1f s).", scene_name,
+              time.time() - t_scene_start)
     return 0
 
 

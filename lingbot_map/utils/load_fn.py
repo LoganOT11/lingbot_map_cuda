@@ -118,16 +118,12 @@ def load_and_preprocess_images(image_path_list, fx=None, fy=None, cx=None, cy=No
 
     Raises:
         ValueError: If the input list is empty or if mode is invalid
-
-    Notes:
-        - Images with different dimensions will be padded with white (value=1.0)
-        - A warning is printed when images have different shapes
-        - When mode="crop": The function ensures width=518px while maintaining aspect ratio
-          and height is center-cropped if larger than 518px
-        - When mode="pad": The function ensures the largest dimension is 518px while maintaining aspect ratio
-          and the smaller dimension is padded to reach a square shape (518x518)
-        - Dimensions are adjusted to be divisible by 14 for compatibility with model requirements
     """
+    return _load_and_preprocess_impl(image_path_list, fx, fy, cx, cy, mode, image_size, patch_size)
+
+
+def _load_and_preprocess_impl(image_path_list, fx=None, fy=None, cx=None, cy=None, mode="crop", image_size=512, patch_size=16, memmap_path=None):
+    """Internal implementation; memmap_path enables lazy disk-backed loading."""
     # Check for empty list
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")

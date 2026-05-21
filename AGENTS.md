@@ -40,6 +40,7 @@ lingbot_map_cuda/
 - `+ --save_images` → also embed uint8 images in NPZ
 - `+ --render OUT.mp4` → full pipeline: inference → NPZ → video
 - `--load_predictions DIR` → **Viewer from NPZ** (reloads images from `--image_folder`)
+- `--lazy_images` → use memmap-backed images (O(window) RAM instead of O(frames))
 - `--input_folder DIR` → batch mode: discover scenes → process all
 
 ### Common Commands
@@ -67,6 +68,12 @@ python apps/cli/demo.py --load_predictions outputs/courthouse/ \
 # Viewer with sky masking
 python apps/cli/demo.py --load_predictions outputs/courthouse/ \
     --image_folder example/courthouse --mask_sky
+
+# Lazy image loading (O(window) RAM for long sequences)
+python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
+    --image_folder example/courthouse --use_sdpa --mode windowed \
+    --window_size 16 --num_scale_frames 4 --headless \
+    --lazy_images --save_predictions outputs/courthouse/
 ```
 
 ## NPZ Format
