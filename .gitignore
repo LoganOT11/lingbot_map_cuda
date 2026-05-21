@@ -16,4 +16,4 @@ models/*.onnx
 
 # Generated data
 example/*_sky_masks
-example/*_npz/
+example/*_npz*/

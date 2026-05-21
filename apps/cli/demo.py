@@ -716,11 +716,12 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
     os.makedirs(dir_path, exist_ok=True)
 
     # Separate sequence arrays from metadata
-    # Skip redundant keys: depth_conf (noisy), pose_enc (redundant with extrinsic)
+    # Skip truly redundant keys only.  depth_conf is NOT redundant — it is the
+    # model's per-pixel uncertainty and essential for clean point clouds.
     seq_keys = []
     meta_dict = {}
     S = None
-    _SKIP_KEYS = {'depth_conf', 'confidence', 'pose_enc'}
+    _SKIP_KEYS = {'pose_enc'}  # redundant with extrinsic
     for key, value in predictions.items():
         if not isinstance(value, np.ndarray):
             continue
@@ -735,7 +736,7 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
 
     if S is None:
         save_dict = {k: v for k, v in predictions.items() if isinstance(v, np.ndarray)}
-        np.savez(os.path.join(dir_path, "frame_000000.npz"), **save_dict)
+        np.savez_compressed(os.path.join(dir_path, "frame_000000.npz"), **save_dict)
         _log.info("Saved predictions to %s/ (1 file, %d keys)", dir_path, len(save_dict))
         return dir_path
 
@@ -743,21 +744,25 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
         frame_dict = {}
         for key in seq_keys:
             val = predictions[key][frame_idx]
-            # Store depth as float16 (half precision, 2× smaller, sufficient for viz)
-            if key == 'depth' and val.dtype == np.float32:
+            # Store depth and depth_conf as float16 (2× smaller, sufficient precision)
+            if key in ('depth', 'depth_conf') and val.dtype == np.float32:
                 val = val.astype(np.float16)
+            # Store depth_conf as uint8 (4× smaller than float16, negligible loss:
+            # values range 1–24, used only for binary threshold filtering)
+            if key == 'depth_conf' and val.dtype == np.float16:
+                val = np.round(val.astype(np.float32)).clip(0, 255).astype(np.uint8)
             # Store images as uint8 (4× smaller than float32)
             if key == 'images' and val.dtype == np.float32:
                 val = (val * 255).clip(0, 255).astype(np.uint8)
             frame_dict[key] = val
-        np.savez(os.path.join(dir_path, f"frame_{frame_idx:06d}.npz"), **frame_dict)
+        np.savez_compressed(os.path.join(dir_path, f"frame_{frame_idx:06d}.npz"), **frame_dict)
 
     n_workers = min(32, S)
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         list(pool.map(_save_frame, range(S)))
 
     if meta_dict:
-        np.savez(os.path.join(dir_path, "meta.npz"), **meta_dict)
+        np.savez_compressed(os.path.join(dir_path, "meta.npz"), **meta_dict)
 
     _log.info("Saved predictions to %s/ (%d frames, %d keys/frame)", dir_path, S, len(seq_keys))
     return dir_path
@@ -803,8 +808,8 @@ def _load_predictions_from_npz(input_path: str) -> dict:
         predictions = {}
         for key in all_keys:
             arr = np.stack([fd[key] for fd in frame_dicts], axis=0)
-            # Upcast float16 depth to float32 for the viewer/renderer
-            if key == 'depth' and arr.dtype == np.float16:
+            # Upcast float16/uint8 depth/depth_conf to float32 for the viewer/renderer
+            if key in ('depth', 'depth_conf') and arr.dtype in (np.float16, np.uint8):
                 arr = arr.astype(np.float32)
             predictions[key] = arr
 
@@ -1258,7 +1263,10 @@ def _run_load_predictions_mode(args) -> int:
         predictions["images"] = reloaded.numpy()
         _log.info("Reloaded %d images, shape %s", len(paths), reloaded.shape)
 
-    # Prepare for viewer (handle both raw model output and NPZ-loaded data)
+    # Upcast float16/uint8 depth/depth_conf to float32 for the viewer/renderer
+    for key in ('depth', 'depth_conf'):
+        if key in predictions and predictions[key].dtype in (np.float16, np.uint8):
+            predictions[key] = predictions[key].astype(np.float32)
     images_cpu = predictions.get("images")
     if isinstance(images_cpu, torch.Tensor):
         images_cpu = images_cpu.detach().cpu()
