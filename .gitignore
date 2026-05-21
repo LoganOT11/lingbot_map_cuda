@@ -15,4 +15,5 @@ models/*.pt
 models/*.onnx
 
 # Generated data
-example/courthouse_sky_masks
+example/*_sky_masks
+example/*_npz/
