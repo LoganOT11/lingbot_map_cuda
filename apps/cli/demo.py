@@ -851,6 +851,15 @@ def _save_predictions_npz(predictions: dict, output_path: str) -> str:
 def _setup_incremental_npz(output_path: str, num_frames: int, args) -> dict:
     """Prepare a directory for incremental per-window NPZ saving.
 
+    Creates a per-window layout::
+
+        output_dir/
+        ├── window_000/  (local frame_000000.npz …)
+        ├── window_001/
+        ├── …
+        ├── alignment.npz   (chunk_scales, chunk_transforms — saved at finalize)
+        └── windows.json    (window boundaries — saved at finalize)
+
     Returns a state dict passed to _on_window_complete and
     _finalize_incremental_npz.
     """
@@ -858,12 +867,20 @@ def _setup_incremental_npz(output_path: str, num_frames: int, args) -> dict:
     if dir_path.endswith('.npz'):
         dir_path = dir_path[:-4]
 
-    # Clean stale files
+    # Clean stale files (both old flat and new per-window)
     if os.path.isdir(dir_path):
         for f in glob.glob(os.path.join(dir_path, 'frame_*.npz')):
             os.remove(f)
         for f in glob.glob(os.path.join(dir_path, 'meta.npz')):
             os.remove(f)
+        for f in glob.glob(os.path.join(dir_path, 'alignment.npz')):
+            os.remove(f)
+        for f in glob.glob(os.path.join(dir_path, 'windows.json')):
+            os.remove(f)
+        # Remove old window subdirectories
+        for d in glob.glob(os.path.join(dir_path, 'window_*')):
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
     os.makedirs(dir_path, exist_ok=True)
 
     return {
@@ -871,23 +888,52 @@ def _setup_incremental_npz(output_path: str, num_frames: int, args) -> dict:
         'num_frames': num_frames,
         'save_images': getattr(args, 'save_images', False),
         'window_count': 0,
+        'window_boundaries': [],  # list of (start, end) per window
+        'image_size': getattr(args, 'image_size', 518),
     }
 
 
 def _on_window_complete(w_pred: dict, start: int, end: int,
                         state: dict, args) -> None:
-    """Per-window callback: save raw window predictions as individual NPZ files.
+    """Per-window callback: save raw (UNALIGNED) window predictions.
 
-    These are *unaligned* intermediate saves — crash recovery and partial
-    preview.  The final aligned predictions are saved by
-    :func:`_finalize_incremental_npz`.
+    Each window gets its own subdirectory with locally-indexed frames.
+    Alignment transforms are saved later by :func:`_finalize_incremental_npz`
+    and applied at load time.
 
     *w_pred* keys are batched as [1, window_len, ...] from the model.
     """
     from concurrent.futures import ThreadPoolExecutor
+    from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 
     dir_path = state['dir']
     window_len = end - start
+    window_idx = state['window_count']
+    window_dir = os.path.join(dir_path, f"window_{window_idx:03d}")
+    os.makedirs(window_dir, exist_ok=True)
+
+    # Compute extrinsic / intrinsic from pose_enc on-the-fly so the
+    # per-window NPZ files are self-contained (needed for deferred alignment).
+    # pose_encoding_to_extri_intri returns w2c (OpenCV: cam-from-world);
+    # we invert to c2w to match the legacy NPZ format.
+    if 'pose_enc' in w_pred and 'extrinsic' not in w_pred:
+        from lingbot_map.utils.geometry import closed_form_inverse_se3_general
+        pe = w_pred['pose_enc']
+        # depth shape: [1, window_len, H, W, 1]
+        H_img, W_img = w_pred['depth'].shape[2], w_pred['depth'].shape[3]
+        ext_w2c, intr = pose_encoding_to_extri_intri(pe, image_size_hw=(H_img, W_img))
+        # Invert w2c → c2w
+        ext_4x4 = torch.zeros(
+            ext_w2c.shape[0], ext_w2c.shape[1], 4, 4,
+            device=ext_w2c.device, dtype=ext_w2c.dtype,
+        )
+        ext_4x4[..., :3, :4] = ext_w2c
+        ext_4x4[..., 3, 3] = 1.0
+        ext_c2w_4x4 = closed_form_inverse_se3_general(ext_4x4)
+        ext_c2w = ext_c2w_4x4[..., :3, :4]
+        w_pred = dict(w_pred)  # shallow copy so we don't mutate original
+        w_pred['extrinsic'] = ext_c2w
+        w_pred['intrinsic'] = intr
 
     # Extract per-frame arrays from the batched window dict
     frame_dicts = []
@@ -905,10 +951,14 @@ def _on_window_complete(w_pred: dict, start: int, end: int,
             else:
                 val = np.asarray(val)
 
-            # Dtype optimisations (mirrors _save_predictions_npz)
-            if key in ('depth', 'depth_conf') and val.dtype == np.float32:
-                val = val.astype(np.float16)
-            if key == 'depth_conf' and val.dtype == np.float16:
+            # Dtype optimisations.
+            # depth_conf → uint8 (lossy but sufficient for threshold filtering).
+            # depth is kept as float32: alignment at load time multiplies by
+            # a scale factor, and float16 quantisation before scaling would
+            # introduce ~0.005 error that breaks bit-identical comparison.
+            if key == 'depth_conf' and val.dtype == np.float32:
+                val = np.round(val).clip(0, 255).astype(np.uint8)
+            elif key == 'depth_conf' and val.dtype == np.float16:
                 val = np.round(val.astype(np.float32)).clip(0, 255).astype(np.uint8)
 
             fd[key] = val
@@ -918,42 +968,224 @@ def _on_window_complete(w_pred: dict, start: int, end: int,
     if not frame_dicts or not any(fd for fd in frame_dicts):
         return
 
-    # Save per-frame NPZ files in parallel
+    # Save per-frame NPZ files in parallel (LOCAL indices within the window)
     def _save_one(idx):
-        global_idx = start + idx
-        path = os.path.join(dir_path, f"frame_{global_idx:06d}.npz")
+        path = os.path.join(window_dir, f"frame_{idx:06d}.npz")
         np.savez_compressed(path, **frame_dicts[idx])
 
     n_workers = min(8, window_len)
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         list(pool.map(_save_one, range(window_len)))
 
+    # Track window boundary for later finalisation
+    state['window_boundaries'].append((start, end))
     state['window_count'] += 1
-    _log.debug("Incremental save: window %d, frames [%d, %d)",
-               state['window_count'], start, end)
+    _log.debug("Incremental save: window %d → %s/ (frames [%d, %d))",
+               window_idx, window_dir, start, end)
 
 
 def _finalize_incremental_npz(predictions: dict, state: dict, args) -> str:
-    """After inference completes with alignment, overwrite incremental
-    NPZ files with the final aligned predictions + metadata.
+    """After inference completes, finalise the NPZ directory.
+
+    Saves two formats side-by-side::
+
+        *Per-window* (primary — enables deferred alignment)::
+            window_000/  window_001/  …  alignment.npz  windows.json
+
+        *Legacy flat* (for backward-compatible comparison)::
+            aligned/frame_000000.npz  frame_000001.npz  …  meta.npz
+
+    The legacy flat subdirectory contains **aligned** predictions and is
+    bit-identical to the backup format.  Loading code
+    (:func:`_load_predictions_from_npz`) auto-detects the per-window format
+    and applies alignment at load time; the aligned/ subdirectory is
+    available for direct comparison with older exports.
 
     Returns the NPZ directory path.
     """
-    _log.info("Finalizing NPZ with aligned predictions (%d frames)...",
-              state['num_frames'])
-    # Re-use the existing bulk save which produces final aligned output
-    return _save_predictions_npz(predictions, state['dir'])
+    import json as _json
+
+    dir_path = state['dir']
+    window_boundaries = state.get('window_boundaries', [])
+
+    # Calculate overlap from consecutive window boundaries
+    overlap = 0
+    if len(window_boundaries) >= 2:
+        _, prev_end = window_boundaries[0]
+        next_start, _ = window_boundaries[1]
+        overlap = prev_end - next_start
+
+    # ── Per-window metadata ──
+    chunk_scales = predictions.get('chunk_scales')
+    chunk_transforms = predictions.get('chunk_transforms')
+    if chunk_scales is not None and chunk_transforms is not None:
+        if isinstance(chunk_scales, torch.Tensor):
+            chunk_scales = chunk_scales.detach().cpu().numpy()
+        if isinstance(chunk_transforms, torch.Tensor):
+            chunk_transforms = chunk_transforms.detach().cpu().numpy()
+        np.savez_compressed(
+            os.path.join(dir_path, 'alignment.npz'),
+            chunk_scales=chunk_scales,
+            chunk_transforms=chunk_transforms,
+        )
+        _log.info("Saved alignment.npz: %d windows, overlap=%d",
+                  len(chunk_scales), overlap)
+    else:
+        _log.info("No alignment metadata — single window or streaming mode")
+
+    windows_meta = {
+        'num_frames': int(state['num_frames']),
+        'num_windows': len(window_boundaries),
+        'overlap': overlap,
+        'windows': [list(b) for b in window_boundaries],  # [[start, end], ...]
+    }
+    with open(os.path.join(dir_path, 'windows.json'), 'w') as f:
+        _json.dump(windows_meta, f, indent=2)
+    _log.info("Saved windows.json: %d windows, %d frames",
+              windows_meta['num_windows'], windows_meta['num_frames'])
+
+    # ── Meta (frame_type, is_keyframe, images) ──
+    meta_dict = {}
+    for key in ('frame_type', 'is_keyframe'):
+        if key in predictions:
+            val = predictions[key]
+            if isinstance(val, torch.Tensor):
+                val = val.detach().cpu().numpy()
+            meta_dict[key] = val
+    if getattr(args, 'save_images', False) and 'images' in predictions:
+        imgs = predictions['images']
+        if isinstance(imgs, torch.Tensor):
+            imgs = imgs.detach().cpu().numpy()
+        if imgs.ndim == 4 and imgs.shape[0] == state['num_frames']:
+            meta_dict['images'] = imgs
+    if meta_dict:
+        np.savez_compressed(os.path.join(dir_path, 'meta.npz'), **meta_dict)
+
+    # ── Legacy flat aligned copy (for backward-compatible comparison) ──
+    aligned_dir = os.path.join(dir_path, 'aligned')
+    _save_predictions_npz(predictions, aligned_dir)
+
+    return dir_path
+
+
+def _load_per_window_format(dir_path: str) -> dict:
+    """Load predictions from the per-window NPZ format.
+
+    Detected by the presence of ``window_000/``.  Loads each window's frames,
+    applies cumulative alignment transforms, and stitches windows together
+    (handling overlap deduplication).
+
+    Returns a flat predictions dict (same structure as the legacy flat format).
+    """
+    import json as _json
+    from concurrent.futures import ThreadPoolExecutor
+    from lingbot_map.utils.alignment import apply_alignment_to_frame
+
+    # Load metadata
+    with open(os.path.join(dir_path, 'windows.json'), 'r') as f:
+        win_meta = _json.load(f)
+    windows = win_meta['windows']  # [[start, end], ...]
+    overlap = win_meta.get('overlap', 0)
+    num_windows = win_meta['num_windows']
+    num_frames = win_meta['num_frames']
+
+    # Load alignment (transforms are already cumulative — each maps its
+    # window directly into window 0's coordinate frame).
+    align_path = os.path.join(dir_path, 'alignment.npz')
+    if os.path.exists(align_path):
+        align = np.load(align_path, allow_pickle=False)
+        cum_scales = np.asarray(align['chunk_scales'], dtype=np.float32)
+        cum_R = np.asarray(align['chunk_transforms'][:, :3, :3], dtype=np.float32)
+        cum_t = np.asarray(align['chunk_transforms'][:, :3, 3], dtype=np.float32)
+    else:
+        cum_scales = np.ones(num_windows, dtype=np.float32)
+        cum_R = np.tile(np.eye(3, dtype=np.float32), (num_windows, 1, 1))
+        cum_t = np.zeros((num_windows, 3), dtype=np.float32)
+
+    # Load all per-window frames in parallel
+    _log.info("Loading %d windows from per-window format...", num_windows)
+
+    def _load_window(wi):
+        wdir = os.path.join(dir_path, f"window_{wi:03d}")
+        frame_files = sorted(glob.glob(os.path.join(wdir, 'frame_*.npz')))
+        frames = []
+        for ff in frame_files:
+            data = np.load(ff, allow_pickle=False)
+            frames.append({key: data[key] for key in data.files})
+        return frames
+
+    with ThreadPoolExecutor(max_workers=min(16, num_windows)) as pool:
+        all_window_frames = list(pool.map(_load_window, range(num_windows)))
+
+    # Apply alignment per window and build global frame list
+    aligned_frames = []  # list of dicts, one per global frame
+    for wi in range(num_windows):
+        start, end = windows[wi]
+        window_frames = all_window_frames[wi]
+        s = float(cum_scales[wi])
+        R = cum_R[wi]
+        t_vec = cum_t[wi]
+
+        is_last = wi == num_windows - 1
+
+        for local_idx, fd in enumerate(window_frames):
+            global_idx = start + local_idx
+
+            # Overlap deduplication: non-final windows only contribute
+            # frames before the overlap region.
+            if not is_last and global_idx >= end - overlap:
+                continue
+
+            # Apply alignment transform
+            result = apply_alignment_to_frame(
+                fd.get('extrinsic', np.eye(3, dtype=np.float32)[:, :4]),
+                fd.get('depth', np.zeros((1, 1), dtype=np.float16)),
+                R, t_vec, s,
+                depth_conf=fd.get('depth_conf'),
+                intrinsic=fd.get('intrinsic'),
+            )
+            aligned_frames.append(result)
+
+    # Stack into flat predictions dict
+    all_keys = list(aligned_frames[0].keys())
+    predictions = {}
+    for key in all_keys:
+        arr = np.stack([fd[key] for fd in aligned_frames], axis=0)
+        if key in ('depth', 'depth_conf') and arr.dtype in (np.float16, np.uint8):
+            arr = arr.astype(np.float32)
+        predictions[key] = arr
+
+    # Load meta.npz (frame_type, is_keyframe, images) if present
+    meta_path = os.path.join(dir_path, 'meta.npz')
+    if os.path.exists(meta_path):
+        meta = np.load(meta_path, allow_pickle=True)
+        for key in meta.files:
+            predictions[key] = meta[key]
+
+    _log.info("Loaded per-window predictions: %d frames, keys=%s",
+              len(aligned_frames), sorted(predictions.keys()))
+    return predictions
 
 
 def _load_predictions_from_npz(input_path: str) -> dict:
     """Load predictions from NPZ directory or single file.
 
-    Returns a dict with numpy arrays.  If depth was saved as float16, it is
-    upcast to float32.  Images may be absent (not saved by default).
+    Supports three formats:
+      1. **Per-window** — ``window_000/`` subdirectories with deferred alignment
+         (alignment applied at load time).
+      2. **Legacy flat** — ``frame_*.npz`` files in a single directory.
+      3. **Single .npz file** — classic combined NPZ.
+
+    Returns a dict with numpy arrays.  Depth/depth_conf upcast to float32.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     if os.path.isdir(input_path):
+        # Detect per-window format
+        if os.path.isdir(os.path.join(input_path, 'window_000')):
+            return _load_per_window_format(input_path)
+
+        # Legacy flat format
         frame_files = sorted(glob.glob(os.path.join(input_path, 'frame_*.npz')))
         if not frame_files:
             npy_files = sorted(glob.glob(os.path.join(input_path, '*.npy')))
