@@ -1,32 +1,31 @@
 """Alignment utilities for deferred window alignment.
 
-Provides functions to compute cumulative transforms from pairwise alignment
-data and to apply those transforms to per-frame predictions (depth, extrinsic)
-at load time.  Enables the per-window NPZ format where raw predictions are
-saved on disk and alignment is deferred to load time.
+During :meth:`~lingbot_map.models.gct_stream_window.GCTStream.inference_windowed`,
+the model processes overlapping windows and computes pairwise similarity
+transforms ``(s, R, t)`` via :meth:`~GCTStream._align_and_stitch_windows`.
+These transforms are **already cumulative** — each maps its window directly
+into window 0's coordinate frame — because ``_pairwise_alignment`` compares
+against the *previously warped* window, which is already in the anchor frame.
 
-Math
-----
-Pairwise alignment between window *k* and *k-1* produces *(s_k, R_k, t_k)*
-that maps a point **x** in window *k*'s raw coordinate frame into the
-already-aligned frame of window *k-1*:
+With deferred alignment, raw (unaligned) per-window frames are saved to disk
+alongside the transforms in ``alignment.npz``.  At load time this module
+applies the transforms to produce the aligned predictions.
 
-    x' = s_k · R_k · x + t_k
+Math (pose_enc → c2w extrinsic)
+--------------------------------
+The warp operates on *pose_enc* (w2c translation ``T`` + quaternion ``R_quat``)::
 
-The cumulative transform from window *k* back to the anchor window 0 is the
-composition of pairwise transforms 1 … k:
+    T'      = s · R · T + t
+    R_quat' = R · R_quat
 
-    S_0   = 1                R_0   = I                t_0   = 0
-    S_k   = s_k · S_{k-1}
-    R_k   = R_k · R_{k-1}
-    t_k   = s_k · R_k · t_{k-1} + t_k
+The stored NPZ uses *c2w extrinsic* where ``c2w_rot = R_quat^T`` and
+``c2w_ctr = −R_quat^T · T``.  Substituting yields::
 
-Applied to a camera extrinsic  [R_c2w │ center]  and depth map
-(where R_c2w is the *transpose* of the pose_enc quaternion matrix)::
+    new_c2w_rot  =  c2w_rot · R^T
+    new_center   =  s · center − c2w_rot · R^T · t
+    new_depth    =  s · depth
 
-    new_R_c2w = R_c2w · R_k^T
-    new_ctr   = S_k · R_k · center + t_k
-    new_depth = S_k · depth
+These are implemented in :func:`apply_alignment_to_frame`.
 """
 
 from __future__ import annotations

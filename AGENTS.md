@@ -14,6 +14,8 @@ Run with: `conda activate lingbot-map && python -u <script> ...`
 ```
 lingbot_map_cuda/
 ├── lingbot_map/           # Core library (models, inference, vis, utils)
+│   └── utils/
+│       └── alignment.py   # Deferred window alignment (apply at load time)
 ├── apps/
 │   ├── cli/
 │   │   ├── demo.py        # Unified pipeline CLI — all modes
@@ -36,8 +38,8 @@ lingbot_map_cuda/
 
 - `--image_folder` / `--video_path` alone → **Interactive viewer** (viser 3D)
 - `+ --headless` → log summary only
-- `+ --save_predictions DIR` → minimal NPZ (depth+extrinsic+intrinsic)
-- `+ --save_images` → also embed uint8 images in NPZ
+- `+ --save_predictions DIR` → **per-window NPZ** (unaligned) + alignment metadata + legacy flat copy
+- `+ --save_images` → also embed uint8 images in meta.npz
 - `+ --render OUT.mp4` → full pipeline: inference → NPZ → video
 - `--load_predictions DIR` → **Viewer from NPZ** (reloads images from `--image_folder`)
 - `--lazy_images` → use memmap-backed images (O(window) RAM instead of O(frames))
@@ -55,7 +57,7 @@ python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --use_sdpa --mode windowed \
     --window_size 16 --overlap_size 4 --num_scale_frames 4 --offload_to_cpu
 
-# Export NPZ (~50 MB for 286 frames)
+# Export NPZ (per-window format + aligned legacy copy)
 python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
     --image_folder example/courthouse --use_sdpa --mode windowed \
     --window_size 16 --num_scale_frames 4 --headless \
@@ -78,30 +80,54 @@ python apps/cli/demo.py --model_path models/lingbot-map-long.pt \
 
 ## NPZ Format
 
-Per-frame files (`frame_000000.npz`) + `meta.npz`. Uses `np.savez_compressed`
-(DEFLATE) with parallel I/O via ThreadPoolExecutor. 286-frame courthouse: **50 MB**.
+`--save_predictions` produces a directory with two complementary layouts:
+
+### Per-window (primary — enables deferred alignment)
+
+```
+output_dir/
+├── window_000/           # Frame NPZs with LOCAL indices (unaligned)
+├── window_001/
+├── ...
+├── alignment.npz         # chunk_scales [W], chunk_transforms [W,4,4]
+├── windows.json          # window boundaries, overlap, frame count
+├── meta.npz              # frame_type, is_keyframe, images (optional)
+└── aligned/              # Legacy flat copy (aligned, bit-identical to backup)
+    ├── frame_000000.npz
+    └── ...
+```
+
+Alignment transforms are computed during inference but **applied at load time**
+by `lingbot_map.utils.alignment`.  Loading code auto-detects the per-window
+format via the presence of `window_000/`.  The `aligned/` subdirectory is a
+backward-compatible flat copy suitable for direct comparison with older exports.
+
+### Legacy flat (per-frame, aligned)
 
 | Key | Dtype | Raw/frame (518×294) | Notes |
 |---|---|---|---|
-| `depth` | float16 | 298 KB | Lossless; upcast to float32 on load |
-| `depth_conf` | **uint8** | 149 KB | Quantized from float16 (±0.5 max error). Used for confidence-based point filtering in viewer |
+| `depth` | float16 | 298 KB | Upcast to float32 on load |
+| `depth_conf` | **uint8** | 149 KB | ±0.5 max quantisation error |
 | `extrinsic` | float32 | 48 B | Camera-to-world 3×4 |
 | `intrinsic` | float32 | 36 B | 3×3 intrinsics |
 | `images` | uint8 | 446 KB | Only with `--save_images` |
 
-Dropped: `pose_enc` (redundant with extrinsic+intrinsic).
+286-frame courthouse: **~50 MB** (aligned flat), **~246 MB** total (per-window
+with float32 depth for bit-accurate deferred alignment).
 
 ## Comparing NPZ Exports
 
-`scripts/compare_npz.py` does frame-by-frame numerical diff of depth, extrinsics, intrinsics:
+`scripts/compare_npz.py` does frame-by-frame numerical diff:
 
 ```bash
-python scripts/compare_npz.py outputs/baseline/ outputs/experiment/
-python scripts/compare_npz.py outputs/baseline/ outputs/experiment/ --metric depth
-python scripts/compare_npz.py outputs/baseline/ outputs/experiment/ --frames 0:50
+# Compare aligned flat copies
+python scripts/compare_npz.py outputs/baseline/aligned/ outputs/experiment/aligned/
+python scripts/compare_npz.py outputs/baseline/aligned/ outputs/experiment/aligned/ --metric depth
+python scripts/compare_npz.py outputs/baseline/aligned/ outputs/experiment/aligned/ --frames 0:50
 ```
 
-Reports per-key: mean |Δ|, max |Δ|, mean |Δ|%, quartiles. Use for quantifying model changes, preprocessing tweaks, or inference parameter ablations.
+The `aligned/` subdirectory is the stable comparison target (bit-identical
+depth, extrinsic rtol=1e-5, depth_conf ±0.5, intrinsic rtol=1e-5).
 
 ## Architecture
 
@@ -110,6 +136,10 @@ Reports per-key: mean |Δ|, max |Δ|, mean |Δ|%, quartiles. Use for quantifying
 **KV cache**: FlashInfer (paged, ~8.6 GB, needs ≥12 GB GPU) or SDPA (dict-based, ~5.5 GB, flag: `--use_sdpa`).
 
 **Pipeline**: `images → preprocess (518×W, crop) → model.forward() → pose_enc [S,9] → extrinsic (3×4) + intrinsic (3×3) → depth [S,H,W,1] → NPZ export`
+
+**Windowed mode**: Overlapping windows processed with fresh KV cache each. `_align_and_stitch_windows()` computes pairwise similarity transforms to bring all windows into the first window's coordinate frame. Per-window callback saves raw predictions incrementally.
+
+**Deferred alignment**: Alignment transforms are saved to `alignment.npz` and applied at load time by `lingbot_map/utils/alignment.py`. This decouples alignment from inference, enabling future overlap recycling and progressive visualization.
 
 **Keyframe interval**: ≤320 frames → interval=1. >320 → auto `ceil(S/320)`. `--flow_threshold >0` → adaptive.
 
@@ -122,9 +152,11 @@ Reports per-key: mean |Δ|, max |Δ|, mean |Δ|%, quartiles. Use for quantifying
 | `lingbot_map/io_protocol.py` | I/O abstractions (FrameSource, PredictionSink, NPZDirectorySink) |
 | `lingbot_map/inference.py` | `load_model`, `postprocess`, `prepare_for_visualization` |
 | `lingbot_map/models/gct_stream.py` | `GCTStream` + `inference_streaming()` |
-| `lingbot_map/models/gct_stream_window.py` | `GCTStream` + `inference_windowed()` |
-| `lingbot_map/utils/pose_enc.py` | 9-dim pose → extrinsics + intrinsics |
+| `lingbot_map/models/gct_stream_window.py` | `GCTStream` + `inference_windowed()` + `_align_and_stitch_windows()` |
+| `lingbot_map/utils/pose_enc.py` | 9-dim pose encoding ↔ extrinsics + intrinsics |
+| `lingbot_map/utils/alignment.py` | Deferred alignment: apply per-window transforms at load time |
 | `lingbot_map/vis/point_cloud_viewer.py` | Interactive viser 3D viewer |
 | `lingbot_map/vis/sky_segmentation.py` | ONNX sky segmentation |
 | `apps/rgbd_render/cli.py` | Standalone render CLI (NPZ → MP4) |
+| `apps/rgbd_render/data/loader.py` | NPZ data loader (handles both legacy flat and per-window formats) |
 | `apps/cli/demo.py` | Unified pipeline CLI — NPZ save/load, viewer, render |
